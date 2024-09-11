@@ -1,0 +1,7 @@
+
+export SHARED_root_DIR="/mnt/shared"
+
+export PATH=${SHARED_root_DIR}/.script:$PATH
+
+typeset -U path
+
