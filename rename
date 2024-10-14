@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+
+import base64
+import collections
+import datetime
+import os
+import sys
+
+import blake3
+import xxhash
+import itertools
+import subprocess
+
+from pathlib import Path
+
+OBSOLETE CODE
+
+root_dir = Path(os.environ['SHARED_root_DIR']) / "photo"
+
+def get_datetime(pth) :
+	ret = subprocess.run(["exiftool", str(pth)], stdout=subprocess.PIPE)
+	for line in ret.stdout.decode('utf8', errors="replace").splitlines() :
+		key, sep, value = line.partition(':')
+		if 'Create Date' == key.strip() :
+			try :
+				return datetime.datetime.strptime(value.strip(), "%Y:%m:%d %H:%M:%S").strftime("%Y%m%d_%H%M%S")
+			except ValueError :
+				pass
+	return None
+	
+def get_checksum(pth) :
+	buf = pth.read_bytes()
+	# hsh = xxhash.xxh3_64(buf).digest()
+	hsh = blake3.blake3(buf).digest()
+	b32 = base64.b32encode(hsh).decode('ascii')
+	return b32, len(buf)
+
+def are_files_identical(a_pth, b_pth) :
+	return a_pth.stat().st_size == b_pth.stat().st_size and a_pth.read_bytes() == b_pth.read_bytes()
+
+ext_map = {
+	'.jpg' : [".jpg", ".jpeg", ".JPG", ".JPEG"],
+	'.png' : [".png", ".PNG"],
+	# '.gif' : [".gif", ".GIF"],
+	'.mp4' : [".mp4", ".MP4"],
+	'.mov' : [".mov", ".MOV"],
+}
+rev_map = dict()
+for k, v_lst in ext_map.items() :
+	for v in v_lst :
+		rev_map[v] = k
+
+class RenamePics() :
+	def __init__(self, dry_run=False) :
+		self.root_dir = root_dir
+		self.dry_run = dry_run
+
+	def write_log(self, s) :
+		if not self.dry_run :
+			with (self.root_dir / "rename.log").open('at') as fid :
+				fid.write(s + '\n')
+		print(s)
+
+	def process_dir(self, work_dir, do_recurse=False) :
+		print(f"process_dir({work_dir}, {do_recurse})")
+		for dst_ext in ext_map :
+			for src_ext in ext_map[dst_ext] :
+				for src_pth in (work_dir.rglob('*' + src_ext) if do_recurse else work_dir.glob('*' + src_ext)) :
+					self.process_file(src_pth, dst_ext)
+
+	def process_file(self, src_pth, dst_ext) :
+	
+		hsh, siz = get_checksum(src_pth)
+		dat = get_datetime(src_pth)
+		
+		base_dir = src_pth.parent
+		src_name = src_pth.name
+		
+		if dat is None :
+			# la date n'a pas pu être extraite de l'exif ou autre, on prend un hash plus grand et on bricole
+			suf = f"~{hsh[:12]}{dst_ext}"
+			if src_name.endswith(suf) :
+				# on l'a sûrement déjà renommé, on touche à rien
+				return
+			dst_name = src_pth.stem + suf
+		else :
+			# la date est connue, on compose un nom standard
+			dst_name = f"{dat}_{hsh[:6]}{dst_ext}"
+			if dst_name == src_name :
+				# on l'a déjà renommé, on touche à rien
+				return
+		
+		dst_pth = base_dir / dst_name
+
+		if dst_pth.is_file() :
+			# le fichier existe déjà, on en met une copie dans _collision
+			# col_pth = self.root_dir / "_collision" / f"{dat}_{hsh}_{siz}{dst_ext}"
+			# if col_pth.is_file() :
+			if are_files_identical(src_pth, dst_pth) :
+				# y a dejà un fichier dans collision aussi
+				if not self.dry_run :
+					src_pth.unlink()
+				self.write_log(f'{src_pth.relative_to(self.root_dir)} -X')
+			else :
+				raise ValueError
+				# on fait plutôt un hardlink
+				# if not self.dry_run :
+				#	col_pth.hardlink_to(dst_pth)
+				# self.write_log(f'{col_pth.relative_to(self.root_dir)} @> {dst_pth.relative_to(self.root_dir)}')
+		else :
+			if not self.dry_run :
+				src_pth.rename(dst_pth)
+			self.write_log(f'{src_pth.relative_to(self.root_dir)} -> {dst_pth.relative_to(self.root_dir)}')
+
+if __name__ == '__main__' :
+	import argparse
+	
+	pa = argparse.ArgumentParser(prog='RenamePics', description='give standard names for images based on exif dates and checksum')
+
+	pa.add_argument('arg_lst', nargs='+', type=Path)
+	pa.add_argument('-n', '--dry-run', action='store_true')
+	pa.add_argument('-r', '--recurse', action='store_true')
+
+	ap = pa.parse_args()
+
+	u = RenamePics(dry_run=ap.dry_run)
+
+	for pth in ap.arg_lst :
+		pth = pth.resolve()
+		if pth.is_dir() :
+			u.process_dir(pth, do_recurse=ap.recurse)
+	
