@@ -1,7 +1,19 @@
 
-export SHARED_root_DIR="/mnt/shared"
 
-export PATH=${SHARED_root_DIR}/.script:$PATH
+export MEMORIES_root_DIR=${0:A:h}
 
+function push_pythonpath() {
+	pth=${1:A}
+	echo "+ ${pth}"
+	export PATH=${pth}/script:$PATH
+	export PYTHONPATH=${pth}/package:$PYTHONPATH
+}
+
+push_pythonpath $MEMORIES_root_DIR
+
+typeset -T PYTHONPATH pythonpath
+
+typeset -U pythonpath
 typeset -U path
 
+mkdir $MEMORIES_root_DIR/log
