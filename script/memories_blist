@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+
+import base64
+import binascii
+import collections
+import mmap
+import pprint
+import struct
+import os
+import sys
+
+from cc_pathlib import Path
+
+import xxhash
+import blake3
+
+memories_dir = Path(os.environ['MEMORIES_root_DIR'])
+blist_dir = memories_dir / "tree" / "blist"
+
+assert (blist_dir / "exo").is_dir()
+assert (blist_dir / "del").is_dir()
+
+class NestedDict(dict):
+	def __getitem__(self, key):
+		if key in self :
+			return self.get(key)
+		return self.setdefault(key, NestedDict())
+
+class Blist() :
+	"""
+		k0 : file size
+		k1 : xxhah3_64
+		k2 : blake3 checksum
+	"""
+	def __init__(self) :
+
+		self.b_pth = blist_dir / "blist.pickle.br"
+		if self.b_pth.is_file() :
+			self.b_map = self.b_pth.load()
+		else :
+			self.b_map = dict()
+		
+	def flush(self) :
+		self.b_pth.save(self.b_map)
+		s_lst = list()
+		p0, p1 = None, None
+		for k0 in sorted(self.b_map) :
+			for k1 in sorted(self.b_map[k0]) :
+				for k2 in sorted(self.b_map[k0][k1]) :
+					s_lst.append([
+						f"{k0:08x}" if p0 != k0 else "--",
+						f"{int.from_bytes(k1):08x}" if p1 != k1 else "--",
+						base64.b32encode(k2).decode('ascii').rstrip('=')
+					])
+					p0, p1 = k0, k1
+		(blist_dir / "blist.debug.tsv").save(s_lst)
+		
+	def add(self, pth) :
+		fs = pth.stat().st_size
+		
+		if fs < 2**8 or 2**31 < fs :
+			return None
+
+		k0 = fs & 0xFFFFFFFF
+		if k0 not in self.b_map :
+			self.b_map[k0] = dict()
+
+		with pth.open("rb") as fid:
+			with mmap.mmap(fid.fileno(), 0, prot=mmap.PROT_READ) as mmp :
+
+				x3 = xxhash.xxh3_64()
+				x3.update(mmp)
+				k1 = x3.digest()[:4]
+
+				if k1 not in self.b_map[k0] :
+					self.b_map[k0][k1] = set()
+
+				b3 = blake3.blake3(max_threads=blake3.blake3.AUTO)
+				b3.update(mmp)
+				k2 = b3.digest()
+
+				if k2 not in self.b_map[k0][k1] :
+					print("+", pth.name)
+					self.b_map[k0][k1].add(k2)
+				else :
+					print("~", pth.name)			
+					
+				return k2 + k1
+
+		raise ValueError
+
+	def check(self, pth) :
+		fs = pth.stat().st_size
+		k0 = fs & 0xFFFFFFFF
+
+		if k0 not in self.b_map :
+			return None
+
+		with pth.open("rb") as fid:
+			with mmap.mmap(fid.fileno(), 0, prot=mmap.PROT_READ) as mmp :
+
+				x3 = xxhash.xxh3_64()
+				x3.update(mmp)
+				k1 = x3.digest()[:4]
+
+				if k1 not in self.b_map[k0] :
+					return None
+
+				b3 = blake3(max_threads=blake3.AUTO)
+				b3.update_mmap(pth)
+				k2 = b3.digest()
+
+				if k2 not in self.b_map[k0][k1] :
+					return None
+
+				return k2 + k1
+
+		raise ValueError
+
+if __name__ == '__main__' :
+
+	u = Blist()
+	for src_pth in (blist_dir / "exo").iterdir() :
+		if src_pth.name.startswith('.') :
+			continue
+		if src_pth.is_file() and not src_pth.is_symlink() :
+			k = u.add(src_pth)
+			if k is not None :
+				dst_pth = blist_dir / "del" / base64.urlsafe_b64encode(k).decode('ascii')
+				src_pth.rename(dst_pth.with_suffix(src_pth.suffix.lower()))
+	u.flush()
+
+	for arg in sys.argv[1:] :
+		target = Path(arg).resolve()
+		if target.is_dir() :
+			for pth in target.rglob('*') :
+				if pth.is_file() and not pth.is_symlink() :
+					k = u.check(pth)
+					if k is not None :
+						print(pth.relative_to(target))
+						dst_pth = blist_dir / "del" / base64.urlsafe_b64encode(k).decode('ascii')
+
+
+
+

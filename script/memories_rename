@@ -24,20 +24,35 @@ def get_datetime(pth) :
 	return None
 	
 def get_checksum(pth) :
-	buf = pth.read_bytes()
-	hsh = blake3.blake3(buf).digest()
-	b32 = base64.b32encode(hsh).decode('ascii')
-	return b32, len(buf)
+	with pth.open("rb") as fid:
+		with mmap.mmap(fid.fileno(), 0, prot=mmap.PROT_READ) as mmp :
+			xx3 = xxhash.xxh3_128()
+			xx3.update(mmp)
+			hsh = xx3.digest()
+			b32 = base64.b32encode(hsh).decode('ascii')
+	return b32, pth.stat().st_size
+
+	# buf = pth.read_bytes()
+	# hsh = blake3.blake3(buf).digest()
+	# b32 = base64.b32encode(hsh).decode('ascii')
+	# return b32, len(buf)
+
+def are_file_same_inodev(a_pth, b_pth) :
+	a_fst, b_fst = a_pth.stat(), b_pth.stat()
+
+	if a_fst.st_ino == b_fst.st_ino and a_fst.st_dev == b_fst.st_dev :
+		return True
 
 def are_files_identical(a_pth, b_pth) :
+	a_fst, b_fst = a_pth.stat(), b_pth.stat()
 
-	a_size = a_pth.stat().st_size
-	b_size = b_pth.stat().st_size
+	if a_fst.st_ino == b_fst.st_ino and a_fst.st_dev == b_fst.st_dev :
+		return True
 
-	if a_size != b_size :
+	if a_fst.st_size != b_fst.st_size :
 		return False
 
-	if a_size < 2**28 : # 256 Mo
+	if a_fst.st_size < 2**28 : # 256 Mo
 		return a_pth.read_bytes() == b_pth.read_bytes()
 
 	with (
@@ -72,14 +87,15 @@ class RenamePhoto() :
 		'.jpeg': '.jpg'
 	}
 
-	def __init__(self, root_dir:Path, dry_run:bool) :
+	def __init__(self, base_dir:Path, dry_run:bool=True) :
 
-		self.root_dir = Path(root_dir).resolve()
-		assert(self.root_dir.is_dir() or self.root_dir.is_mount())
+		self.base_dir = Path(base_dir).resolve()
+		assert self.base_dir.is_dir()
 
 		self.dry_run = dry_run
 
-		self.log_pth = Path(os.environ['MEMORIES_root_DIR']) / "log" / f"rename_photo.{datetime.datetime.now():%Y%m%d_%H%M%S}.log"
+		self.log_dir = (Path(os.environ['MEMORIES_root_DIR']) / "log" / "rename").make_dirs()
+		self.log_pth = self.log_dir / f"{datetime.datetime.now():%Y%m%d_%H%M%S}.log"
 
 	def write_log(self, s) :
 		if self.dry_run :
@@ -88,19 +104,17 @@ class RenamePhoto() :
 			with self.log_pth.open('at') as fid :
 				fid.write(s + '\n')
 
-	def process_dir(self, base_dir, do_recurse=False) :
+	def process_dir(self, self.base_dir, do_recurse=False) :
 		print(f"process_dir({work_dir}, {do_recurse})")
 
 		work_dir = Path(work_dir).resolve()
 
 		q_set = set()
-		d_lst = [base_dir,]
+		d_lst = [self.base_dir,]
 
 		while d_lst :
-
-			base_dir = d_lst.pop(0)
-
-			for src_pth in base_dir :
+			self.base_dir = d_lst.pop(0)
+			for src_pth in self.base_dir :
 				if src_pth.is_file() :
 					src_ext = src_pth.suffix.lower()
 					dst_ext = self.repl_map.get(src_ext, src_ext)

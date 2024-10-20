@@ -16,4 +16,4 @@ typeset -T PYTHONPATH pythonpath
 typeset -U pythonpath
 typeset -U path
 
-mkdir $MEMORIES_root_DIR/log
+# mkdir $MEMORIES_root_DIR/log
