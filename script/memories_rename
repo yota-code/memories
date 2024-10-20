@@ -13,6 +13,10 @@ import subprocess
 from cc_pathlib import Path
 
 def get_datetime(pth) :
+	""" utilise exiftool pour trouver un date dans les métadonnées """
+	""" TAG
+
+    Extract information for the specified tag (eg. -CreateDate)."""
 	ret = subprocess.run(["exiftool", str(pth)], stdout=subprocess.PIPE)
 	for line in ret.stdout.decode('utf8', errors="replace").splitlines() :
 		key, sep, value = line.partition(':')
