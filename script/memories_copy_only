@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+
+import sys
+
+from cc_pathlib import Path
+
+suffix_lst = ['.jpg', '.JPEG', '.JPG', '.mp4']
+
+src_root = Path(sys.argv[1]).resolve()
+dst_root = Path(sys.argv[2]).resolve()
+
+suffix_set = set()
+
+for src_pth in src_root.iter_on_files(* suffix_lst) :
+	print(src_pth.relative_to(src_root))
+	suffix_set.add(src_pth.suffix)
+	dst_pth = dst_root / src_pth.relative_to(src_root)
+	dst_pth.make_parents()
+	src_pth.rename(dst_pth)
+
+print(suffix_set)
+src_root.delete_empty_dirs()

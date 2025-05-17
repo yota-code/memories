@@ -1,0 +1,9 @@
+#!/usr/bin/env python3
+
+from cc_pathlib import Path
+
+import sys
+
+from  memories.photo import MemoriesPhoto
+
+MemoriesPhoto().rename_dir()

@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+
+"""
+Take files which are in dated subdirs.
+Apply only on p&b dir
+"""
+
+import sys
+
+from cc_pathlib import Path
+
+src_root = Path(sys.argv[1]).resolve()
+dst_root = Path(sys.argv[2]).resolve()
+
+if src_root.name != "pnb" :
+	raise ValueError
+
+for sub in src_root.iter_dirs() :
+	f_lst = [(pth.stat().st_mtime, pth) for pth in sub.iter_files() if pth.suffix == '.jpg']
+	if f_lst :
+		for n, (t, f) in enumerate(sorted(f_lst)) :
+			# print(dst_root / f"{sub.name}_{n+1:02}.jpg")
+			f.rename(dst_root / f"{sub.name}_{n+1:02}.jpg")
+		
