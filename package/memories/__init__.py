@@ -5,56 +5,78 @@ sous manjaro, nécessite le paquet : exiftool
 """
 
 import base64
+import collections
 import datetime
 import enum
 import functools
 import logging
 import mmap
-import multiprocessing
 import os
 import re
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 import xxhash
 from cc_pathlib import Path
 
 
-def setup_logger(name, log_file, level=logging.INFO):
-	"""To setup as many loggers as you want"""
-
-	handler = logging.FileHandler(log_file)
-
+def setup_logger(name, log_file=None, to_stdout=True, level=logging.INFO):
 	logger = logging.getLogger(name)
 	logger.setLevel(level)
-	logger.addHandler(handler)
-	logger.addHandler(logging.StreamHandler(sys.stdout))
+
+	if logger.hasHandlers():
+		logger.handlers.clear()
+
+	if to_stdout:
+		logger.addHandler(logging.StreamHandler(sys.stdout))
+
+	if log_file:
+		logger.addHandler(logging.FileHandler(log_file))
 
 	return logger
 
 
 class RenameStatus(enum.Enum):
 	ALREADY = 0
-	RENAMED = 1
+	RENAME = 1
 	DUPLICATE = 2
+	TRASH = -1
 
 
 hash16_rec = re.compile(r"^[A-Z2-7]{16}$")
-format_rec = re.compile(r"(([0-9]{8}_[0-9]{6}\.[A-Z2-7]{6})")
+# format_rec = re.compile(r"^[0-9]{8}_[0-9]{6}\.[A-Z2-7]{6}$")
 
 
 class Memories:
 	# and videos
 
-	hashed_res = re.compile(r"(([0-9]{8}_[0-9]{6}\.[A-Z2-7]{6})|(\.[A-Z2-7]{16}))$")
+	# hashed_res = re.compile(r"(([0-9]{8}_[0-9]{6}\.[A-Z2-7]{6})|(\.[A-Z2-7]{16}))$")
 
 	suffix_set = frozenset({".jpg", ".jpeg", ".png", ".mp4", ".mov"})
-	replace_map = frozendict({".jpeg": ".jpg"})
+	replace_map = {".jpeg": ".jpg"}
 
 	def __init__(self):
-		data_dir = (Path(os.environ["MEMORIES_root_DIR"]) / "data").resolve(strict=True)
+		self.data_dir = (Path(os.environ["MEMORIES_root_DIR"]) / "data").resolve(
+			strict=True
+		)
+		assert self.data_dir.is_dir()
+
+		if not (self.data_dir / ".memories").is_dir():
+			(self.data_dir / ".memories").make_dirs()
+
+		self.trash_pth = self.data_dir / ".memories" / "trash"
+		if not self.trash_pth.is_file():
+			self.trash_pth.write_text("")
+		else:
+			self.trash_set = {
+				line.strip()
+				for line in self.trash_pth.read_text().splitlines()
+				if line.strip()
+			}
+
 		self.rename_log = setup_logger(
-			"rename", (data_dir / ".memories" / "rename.log").make_parents()
+			"rename", (self.data_dir / ".memories" / "rename.log").make_parents()
 		)
 		self.rename_log.info(f"tutu {hash(self)}")
 
@@ -67,7 +89,14 @@ class Memories:
 			xx3.update(mmp)
 			hsh = xx3.digest()
 			b32 = base64.b32encode(hsh).decode("ascii")[:24]
-		return b32
+		return b32, pth.stat().st_size
+
+	def get_checksum(self, pth):
+		with pth.open("rb") as fid:
+			xx3 = xxhash.xxh3_128(fid.read())
+			hsh = xx3.digest()
+			b32 = base64.b32encode(hsh).decode("ascii")[:24]
+		return b32, pth.stat().st_size
 
 	def get_datetime(self, pth):
 		"""utilise exiftool pour trouver un date dans les métadonnées"""
@@ -88,15 +117,19 @@ class Memories:
 					pass
 		return None
 
-	def rename_file(self, cwd, src_pth, dry_run=True):
+	def scan_file(self, cwd, src_pth):
 		# print(f"rename_file({cwd}, {src_pth})")
 
 		# if self.hashed_res.search(src_pth.stem) is not None :
 		# 	# on dirait bien que le boulot est déjà fait
 		# 	return
 
-		hsh = self.get_checksum(src_pth)
+		key = self.get_checksum(src_pth)
+		hsh = key[0]
 		dat = self.get_datetime(src_pth)
+
+		if hsh in self.trash_set:
+			return (key, dat, src_pth.relative_to(cwd), None)
 
 		suf = self.replace_map.get(src_pth.suffix.lower(), src_pth.suffix.lower())
 
@@ -108,97 +141,43 @@ class Memories:
 		else:
 			dst_pth = src_pth.parent / f"{dat}.{hsh[:6]}{suf}"
 
-		if dst_pth == src_pth:
-			print(f"{dst_pth.relative_to(cwd)} DUPLICATE !!")
-			return (
-				RenameStatus.DUPLICATE,
-				src_pth.relative_to(cwd),
-				dst_pth.relative_to(cwd),
-			)
-		else:
-			print(f"{src_pth.relative_to(cwd)} -> {dst_pth.relative_to(cwd)}")
-			return (
-				RenameStatus.RENAMED,
-				src_pth.relative_to(cwd),
-				dst_pth.relative_to(cwd),
-			)
+		return (key, dat, src_pth.relative_to(cwd), dst_pth.relative_to(cwd))
+
+	def process_file(self, cwd, key, dry_run=True):
+		dat, src_pth, dst = self.f_ma[key]
+
+		if dst_pth is None:
+			return RenameStatus.TRASH
+
+		if src_pth == dst_pth:
+			return RenameStatus.ALREADY
+
+		if dst_pth.exists():
+			if are_file_same_inodev(src_pth, dst_pth):
+				return RenameStatus.ALREADY
+			elif are_files_identical(src_pth, dst_pth):
+				return RenameStatus.DUPLICATE
+			else:
+				return RenameStatus.RENAME
+
+		return RenameStatus.RENAME
 
 	def rename_dir(self, cwd=None, dry_run=True):
-		cwd = (Path(cwd) if cwd is not None else Path()).resolve()
+		cwd = (Path(cwd) if cwd is not None else self.data_dir).resolve()
 
-		print(f"rename_dir({cwd})")
+		print(f">>> rename_dir({cwd})")
 
 		p_gen = cwd.iter_on_suffix(*self.suffix_set)
-		p_fct = functools.partial(Memories.rename_file, self, cwd)
+		p_fct = functools.partial(Memories.scan_file, self, cwd)
 
-		with multiprocessing.Pool() as pool:
-			for ret in pool.map(p_fct, p_gen):
+		f_map = collections.defaultdict(list)
+
+		with ThreadPoolExecutor() as pool:
+			for key, dat, src, dst in pool.map(p_fct, p_gen):
+				f_map[key].append((dat, src, dst))
 				self.rename_log.info(
-					f"{ret[0].name} :: {cwd.relative_to(self.base_dir)} / {ret[1]} -> {ret[2]}"
+					f"{key}\t{cwd.relative_to(self.data_dir)} / {src} -> {dst}"
 				)
-
-	def _process_dir(self, src_pth):
-		raise RuntimeError("obsolete")
-		q_set = set()
-		d_lst = [
-			self.base_dir,
-		]
-
-		while d_lst:
-			self.base_dir = d_lst.pop(0)
-			for src_pth in self.base_dir:
-				if src_pth.is_file():
-					src_ext = src_pth.suffix.lower()
-					dst_ext = self.repl_map.get(src_ext, src_ext)
-					if dst_ext in self.proc_set:
-						try:
-							self.process_file(src_pth, dst_ext)
-						except ValueError:
-							q_set.add((src_pth, dst_ext))
-
-				elif src_pth.is_dir():
-					if self.do_recurse:
-						d_lst.append(src_pth)
-
-	def _process_file(self, src_pth, dst_ext):
-		raise RuntimeError("obsolete")
-
-		dat = self.get_datetime(src_pth)
-		hsh = self.get_checksum(src_pth)
-
-		if dat is None:
-			dst_name = f"{src_pth.fname}_{hsh}{dst_ext}"
-			if src_pth.name.endswith(f"_{hsh}{dst_ext}"):
-				# on renomme pas ! ça a déjà été fait
-				return
-		else:
-			dst_name = f"{dat}_{hsh[:6]}{dst_ext}"
-			if dst_name == src_pth.name:
-				# le nom qu'on veut donner, c'est le nom qu'il a déjà, pas besoin de le renommer
-				return
-
-		dst_pth = src_pth.parent / dst_name
-
-		if dst_pth.is_file():
-			# il y a dejà un fichier au même endroit et qui a le même nom !
-			if self.are_files_identical(src_pth, dst_pth):
-				# le fichier traité existe déjà sous un autre nom, on supprime ce premier
-				if not self.dry_run:
-					src_pth.unlink()
-				self.write_log(f"{src_pth.relative_to(self.root_dir)} -X")
-			else:
-				# sinon, on lève une erreur, Houston, on a un problème
-				self.write_log(
-					f"{col_pth.relative_to(self.root_dir)} ?! {dst_pth.relative_to(self.root_dir)}"
-				)
-				raise FileExistsError
-		else:
-			# il n'y a pas de fichier, on renomme
-			if not self.dry_run:
-				src_pth.rename(dst_pth)
-			self.write_log(
-				f"{src_pth.relative_to(self.root_dir)} -> {dst_pth.relative_to(self.root_dir)}"
-			)
 
 
 if __name__ == "__main__":
