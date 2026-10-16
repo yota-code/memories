@@ -4,6 +4,6 @@ from cc_pathlib import Path
 
 import sys
 
-from  memories.photo import MemoriesPhoto
+from  memories import Memories
 
-MemoriesPhoto().rename_dir()
+u = Memories()# .rename_dir(Path(sys.argv[1]))

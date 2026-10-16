@@ -12,6 +12,8 @@ import subprocess
 
 from cc_pathlib import Path
 
+raise RuntimeError("this code is obsolete")
+
 def get_datetime(pth) :
 	""" utilise exiftool pour trouver un date dans les métadonnées """
 	""" TAG

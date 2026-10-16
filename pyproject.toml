@@ -1,0 +1,4 @@
+tool.ruff.target-version = "py315"
+
+[tool.ruff.format]
+indent-style = "tab"
