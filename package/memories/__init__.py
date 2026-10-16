@@ -15,6 +15,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import xxhash
@@ -45,29 +46,31 @@ class RenameStatus(enum.Enum):
 
 
 hash16_rec = re.compile(r"^[A-Z2-7]{16}$")
-# format_rec = re.compile(r"^[0-9]{8}_[0-9]{6}\.[A-Z2-7]{6}$")
+processed_rec = re.compile(r"^[0-9]{8}_[0-9]{6}\.[A-Z2-7]{6}$")
 
 
 class Memories:
 	# and videos
 
-	# hashed_res = re.compile(r"(([0-9]{8}_[0-9]{6}\.[A-Z2-7]{6})|(\.[A-Z2-7]{16}))$")
-
 	suffix_set = frozenset({".jpg", ".jpeg", ".png", ".mp4", ".mov"})
 	replace_map = {".jpeg": ".jpg"}
 
-	def __init__(self):
+	def __init__(self, cwd=None):
 		self.data_dir = (Path(os.environ["MEMORIES_root_DIR"]) / "data").resolve(
 			strict=True
 		)
 		assert self.data_dir.is_dir()
 
+		self.cwd = self.data_dir if cwd is None else Path(cwd).resolve(strict=True)
+		self.cwd.relative_to(self.data_dir)
+
 		if not (self.data_dir / ".memories").is_dir():
 			(self.data_dir / ".memories").make_dirs()
 
-		self.trash_pth = self.data_dir / ".memories" / "trash"
+		self.trash_pth = self.data_dir / ".memories" / "_trash"
 		if not self.trash_pth.is_file():
 			self.trash_pth.write_text("")
+			self.trash_set = set()
 		else:
 			self.trash_set = {
 				line.strip()
@@ -75,12 +78,11 @@ class Memories:
 				if line.strip()
 			}
 
-		self.rename_log = setup_logger(
-			"rename", (self.data_dir / ".memories" / "rename.log").make_parents()
-		)
-		self.rename_log.info(f"tutu {hash(self)}")
+		self.log_pth = self.data_dir / ".memories" / "rename.log"
 
-	def get_checksum(self, pth):
+		self.scan_dir()
+
+	def get_checksum_old(self, pth):
 		with (
 			pth.open("rb") as fid,
 			mmap.mmap(fid.fileno(), 0, prot=mmap.PROT_READ) as mmp,
@@ -96,7 +98,12 @@ class Memories:
 			xx3 = xxhash.xxh3_128(fid.read())
 			hsh = xx3.digest()
 			b32 = base64.b32encode(hsh).decode("ascii")[:24]
-		return b32, pth.stat().st_size
+		return b32 + f"_{pth.stat().st_size & 0xFFFF_FFFF:08X}"
+
+	def is_already_processed(self, pth):
+		return hash16_rec.match(pth.suffixes[-2]) is not None or processed_rec.match(
+			"".join(pth.suffixes[:2])
+		)
 
 	def get_datetime(self, pth):
 		"""utilise exiftool pour trouver un date dans les métadonnées"""
@@ -118,70 +125,48 @@ class Memories:
 		return None
 
 	def scan_file(self, cwd, src_pth):
-		# print(f"rename_file({cwd}, {src_pth})")
 
-		# if self.hashed_res.search(src_pth.stem) is not None :
-		# 	# on dirait bien que le boulot est déjà fait
-		# 	return
-
-		key = self.get_checksum(src_pth)
-		hsh = key[0]
+		hsh = self.get_checksum(src_pth)
 		dat = self.get_datetime(src_pth)
 
 		if hsh in self.trash_set:
-			return (key, dat, src_pth.relative_to(cwd), None)
+			return (hsh, dat, src_pth.relative_to(cwd), None)
 
 		suf = self.replace_map.get(src_pth.suffix.lower(), src_pth.suffix.lower())
 
 		if dat is None:
-			# val = src_pth.suffixes[-2].strip(".")
-			# if hash16_rec.match(val) is not None and hash16_rec.group(0) == val:
-			# 	dst_pth = src_pth.parent / f"{src_pth.fname}.{hsh[:16]}{suf}"
 			dst_pth = src_pth.parent / f"{src_pth.fname}.{hsh[:16]}{suf}"
 		else:
 			dst_pth = src_pth.parent / f"{dat}.{hsh[:6]}{suf}"
 
-		return (key, dat, src_pth.relative_to(cwd), dst_pth.relative_to(cwd))
+		return (hsh, dat, src_pth.relative_to(cwd), dst_pth.relative_to(cwd))
 
-	def process_file(self, cwd, key, dry_run=True):
-		dat, src_pth, dst = self.f_ma[key]
+	def scan_dir(self):
+		t_start = time.perf_counter_ns()
+		p_gen = self.cwd.iter_on_suffix(*self.suffix_set)
+		p_fct = functools.partial(Memories.scan_file, self, self.cwd)
 
-		if dst_pth is None:
-			return RenameStatus.TRASH
+		self.f_map = collections.defaultdict(list)
 
-		if src_pth == dst_pth:
-			return RenameStatus.ALREADY
-
-		if dst_pth.exists():
-			if are_file_same_inodev(src_pth, dst_pth):
-				return RenameStatus.ALREADY
-			elif are_files_identical(src_pth, dst_pth):
-				return RenameStatus.DUPLICATE
-			else:
-				return RenameStatus.RENAME
-
-		return RenameStatus.RENAME
-
-	def rename_dir(self, cwd=None, dry_run=True):
-		cwd = (Path(cwd) if cwd is not None else self.data_dir).resolve()
-
-		print(f">>> rename_dir({cwd})")
-
-		p_gen = cwd.iter_on_suffix(*self.suffix_set)
-		p_fct = functools.partial(Memories.scan_file, self, cwd)
-
-		f_map = collections.defaultdict(list)
-
+		i = 0
 		with ThreadPoolExecutor() as pool:
-			for key, dat, src, dst in pool.map(p_fct, p_gen):
-				f_map[key].append((dat, src, dst))
-				self.rename_log.info(
-					f"{key}\t{cwd.relative_to(self.data_dir)} / {src} -> {dst}"
-				)
+			for hsh, dat, src, dst in pool.map(p_fct, p_gen):
+				self.f_map[hsh].append((dat, src, dst))
+				i += 1
 
+		t_stop = time.perf_counter_ns()
 
-if __name__ == "__main__":
-	import sys
+		print(f"scan {i} files in {int((t_stop - t_start) / 1e6)}ms")
 
-	u = Memories(Path(sys.argv[1]))
-	u.rename(Path(sys.argv[2]))
+	def process(self, dry_run=True):
+		logger = setup_logger("rename", log_file=None if dry_run else self.log_pth)
+		for key in self.f_map:
+			for i, elem in enumerate(self.f_map[key]):
+				dat, src, dst = elem
+				if dst is None:
+					logger.info(f"{key}\t{dat}\t{src} --X")
+					continue
+				if i == 0:
+					logger.info(f"{key}\t{dat}\t{src} --> {dst}")
+				else:
+					logger.info(f"{key}\t{dat}\t{src} <-> {self.f_map[key][0][1]}")
