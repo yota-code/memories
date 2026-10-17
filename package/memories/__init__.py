@@ -39,10 +39,11 @@ def setup_logger(name, log_file=None, to_stdout=True, level=logging.INFO):
 
 
 class RenameStatus(enum.Enum):
-	ALREADY = 0
+	DONE = 0
 	RENAME = 1
 	DUPLICATE = 2
 	TRASH = -1
+	PRIVATE = -2
 
 
 hash16_rec = re.compile(r"^[A-Z2-7]{16}$")
@@ -67,37 +68,42 @@ class Memories:
 		if not (self.data_dir / ".memories").is_dir():
 			(self.data_dir / ".memories").make_dirs()
 
-		self.trash_pth = self.data_dir / ".memories" / "_trash"
-		if not self.trash_pth.is_file():
-			self.trash_pth.write_text("")
-			self.trash_set = set()
-		else:
-			self.trash_set = {
-				line.strip()
-				for line in self.trash_pth.read_text().splitlines()
-				if line.strip()
-			}
+		self.trash_pth, self.trash_set = self.setup_list("_trash")
+		self.private_pth, self.private_set = self.setup_list("_private")
 
 		self.log_pth = self.data_dir / ".memories" / "rename.log"
 
 		self.scan_dir()
 
-	def get_checksum_old(self, pth):
-		with (
-			pth.open("rb") as fid,
-			mmap.mmap(fid.fileno(), 0, prot=mmap.PROT_READ) as mmp,
-		):
-			xx3 = xxhash.xxh3_128()
-			xx3.update(mmp)
-			hsh = xx3.digest()
-			b32 = base64.b32encode(hsh).decode("ascii")[:24]
-		return b32, pth.stat().st_size
+	def setup_list(self, name):
+		list_pth = self.data_dir / ".memories" / f"_{name}"
+		if not list_pth.is_file():
+			list_pth.write_text("")
+			list_set = set()
+		else:
+			list_set = {
+				line.strip()
+				for line in list_pth.read_text().splitlines()
+				if line.strip()
+			}
+
+		list_dir = self.data_dir / f".{name}"
+
+		# on récupère les fichiers présents dans les sous dossiers pour compléter les listes
+		list_dir.make_dirs()
+		for suf in self.suffix_set:
+			for pth in list_dir.glob("*" + suf):
+				list_set.add(self.get_checksum(pth))
+
+		list_pth.write_text("\n".join(sorted(list_set)))
+
+		return list_pth, list_set
 
 	def get_checksum(self, pth):
 		with pth.open("rb") as fid:
 			xx3 = xxhash.xxh3_128(fid.read())
-			hsh = xx3.digest()
-			b32 = base64.b32encode(hsh).decode("ascii")[:24]
+		hsh = xx3.digest()
+		b32 = base64.b32encode(hsh).decode("ascii")[:24]
 		return b32 + f"_{pth.stat().st_size & 0xFFFF_FFFF:08X}"
 
 	def is_already_processed(self, pth):
@@ -124,34 +130,41 @@ class Memories:
 					pass
 		return None
 
-	def scan_file(self, cwd, src_pth):
+	def scan_file(self, src_pth):
 
 		hsh = self.get_checksum(src_pth)
 		dat = self.get_datetime(src_pth)
 
-		if hsh in self.trash_set:
-			return (hsh, dat, src_pth.relative_to(cwd), None)
+		src = src_pth.relative_to(self.cwd)
 
-		suf = self.replace_map.get(src_pth.suffix.lower(), src_pth.suffix.lower())
+		if hsh in self.trash_set:
+			return (hsh, ".trash", dat, src, None)
+
+		suf = src_pth.suffix.lower()
+		suf = self.replace_map.get(suf, suf)
 
 		if dat is None:
 			dst_pth = src_pth.parent / f"{src_pth.fname}.{hsh[:16]}{suf}"
 		else:
 			dst_pth = src_pth.parent / f"{dat}.{hsh[:6]}{suf}"
 
-		return (hsh, dat, src_pth.relative_to(cwd), dst_pth.relative_to(cwd))
+		dst = dst_pth.relative_to(self.cwd)
+
+		if hsh in self.private_set:
+			return (hsh, ".private", dat, src, dst)
+		else:
+			return (hsh, ".", dat, src, dst)
 
 	def scan_dir(self):
 		t_start = time.perf_counter_ns()
 		p_gen = self.cwd.iter_on_suffix(*self.suffix_set)
-		p_fct = functools.partial(Memories.scan_file, self, self.cwd)
 
 		self.f_map = collections.defaultdict(list)
 
 		i = 0
 		with ThreadPoolExecutor() as pool:
-			for hsh, dat, src, dst in pool.map(p_fct, p_gen):
-				self.f_map[hsh].append((dat, src, dst))
+			for hsh, sub, dat, src, dst in pool.map(self.scan_file, p_gen):
+				self.f_map[hsh].append((sub, dat, src, dst))
 				i += 1
 
 		t_stop = time.perf_counter_ns()
@@ -162,11 +175,13 @@ class Memories:
 		logger = setup_logger("rename", log_file=None if dry_run else self.log_pth)
 		for key in self.f_map:
 			for i, elem in enumerate(self.f_map[key]):
-				dat, src, dst = elem
+				sub, dat, src, dst = elem
 				if dst is None:
-					logger.info(f"{key}\t{dat}\t{src} --X")
+					logger.info(f"{key}\t{sub}\t{dat}\t{src} \x1b[31m--X\x1b[0m")
 					continue
 				if i == 0:
-					logger.info(f"{key}\t{dat}\t{src} --> {dst}")
+					logger.info(f"{key}\t{sub}\t{dat}\t{src} \x1b[32m-->\x1b[0m {dst}")
 				else:
-					logger.info(f"{key}\t{dat}\t{src} <-> {self.f_map[key][0][1]}")
+					logger.info(
+						f"{key}\t{sub}\t{dat}\t{src} \x1b[33m<->\x1b[0m {self.f_map[key][0][1]}"
+					)

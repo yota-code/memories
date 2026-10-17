@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+
+import sys
+
+from cc_pathlib import Path
+from memories import Memories
+
+u = Memories()
+
+for arg in sys.agv[1:]:
+	u.set_trash()

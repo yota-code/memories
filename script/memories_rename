@@ -10,6 +10,6 @@ cwd = Path(sys.argv[1]).resolve(strict=True) if sys.argv[1:] else None
 u = Memories(cwd)
 u.process(dry_run=False)
 
-# z = input("apply changes ? ")
-# if z.lower() in ("y", "yes"):
-# 	u.rename_dir(cwd, dry_run=False)
+z = input("apply changes ? ")
+if z.lower() in ("y", "yes"):
+	u.process(cwd, dry_run=False)
