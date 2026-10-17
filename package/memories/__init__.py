@@ -6,6 +6,7 @@ sous manjaro, nécessite le paquet : exiftool
 
 import base64
 import collections
+import dataclasses
 import datetime
 import enum
 import functools
@@ -20,6 +21,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 import xxhash
 from cc_pathlib import Path
+
+data_dir = (Path(os.environ["MEMORIES_root_DIR"]) / "data").resolve(strict=True)
+
+assert data_dir.is_dir(), f"{data_dir} is not a directory"
 
 
 def setup_logger(name, log_file=None, to_stdout=True, level=logging.INFO):
@@ -36,6 +41,15 @@ def setup_logger(name, log_file=None, to_stdout=True, level=logging.INFO):
 		logger.addHandler(logging.FileHandler(log_file))
 
 	return logger
+
+
+@dataclasses.dataclass(slots=True)
+class RenameFile:
+	rel: Path  # path relative to data_dir
+	suf: str = None
+	dat: str = None
+	hsh: str = None
+	mtime: float = None
 
 
 class RenameStatus(enum.Enum):
@@ -56,27 +70,23 @@ class Memories:
 	suffix_set = frozenset({".jpg", ".jpeg", ".png", ".mp4", ".mov"})
 	replace_map = {".jpeg": ".jpg"}
 
-	def __init__(self, cwd=None):
-		self.data_dir = (Path(os.environ["MEMORIES_root_DIR"]) / "data").resolve(
-			strict=True
-		)
-		assert self.data_dir.is_dir()
+	def __init__(self):
 
-		self.cwd = self.data_dir if cwd is None else Path(cwd).resolve(strict=True)
-		self.cwd.relative_to(self.data_dir)
+		if not (data_dir / ".memories").is_dir():
+			(data_dir / ".memories").make_dirs()
 
-		if not (self.data_dir / ".memories").is_dir():
-			(self.data_dir / ".memories").make_dirs()
+		self.trash_pth, self.trash_set = self.setup_list("trash")
+		self.private_pth, self.private_set = self.setup_list("private")
 
-		self.trash_pth, self.trash_set = self.setup_list("_trash")
-		self.private_pth, self.private_set = self.setup_list("_private")
+		(data_dir / "_collision").make_dirs()
 
-		self.log_pth = self.data_dir / ".memories" / "rename.log"
+		self.f_map = collections.defaultdict(list)
 
 		self.scan_dir()
+		self.scan_dir(data_dir / ".private")
 
 	def setup_list(self, name):
-		list_pth = self.data_dir / ".memories" / f"_{name}"
+		list_pth = data_dir / ".memories" / f"_{name}"
 		if not list_pth.is_file():
 			list_pth.write_text("")
 			list_set = set()
@@ -87,7 +97,7 @@ class Memories:
 				if line.strip()
 			}
 
-		list_dir = self.data_dir / f".{name}"
+		list_dir = data_dir / f".{name}"
 
 		# on récupère les fichiers présents dans les sous dossiers pour compléter les listes
 		list_dir.make_dirs()
@@ -99,19 +109,21 @@ class Memories:
 
 		return list_pth, list_set
 
-	def get_checksum(self, pth):
+	def write_list(self, name, item):
+		list_pth = data_dir / ".memories" / f"_{name}"
+		with list_pth.open("at") as fid:
+			fid.write(item + "\n")
+
+	@staticmethod
+	def get_checksum(pth):
 		with pth.open("rb") as fid:
 			xx3 = xxhash.xxh3_128(fid.read())
 		hsh = xx3.digest()
 		b32 = base64.b32encode(hsh).decode("ascii")[:24]
 		return b32 + f"_{pth.stat().st_size & 0xFFFF_FFFF:08X}"
 
-	def is_already_processed(self, pth):
-		return hash16_rec.match(pth.suffixes[-2]) is not None or processed_rec.match(
-			"".join(pth.suffixes[:2])
-		)
-
-	def get_datetime(self, pth):
+	@staticmethod
+	def get_datetime(pth):
 		"""utilise exiftool pour trouver un date dans les métadonnées"""
 		""" TAG
 
@@ -130,58 +142,103 @@ class Memories:
 					pass
 		return None
 
-	def scan_file(self, src_pth):
+	def is_already_processed(self, pth):
+		return hash16_rec.match(pth.suffixes[-2]) is not None or processed_rec.match(
+			"".join(pth.suffixes[:2])
+		)
 
-		hsh = self.get_checksum(src_pth)
-		dat = self.get_datetime(src_pth)
+	@staticmethod
+	def get_file(pth: Path):
 
-		src = src_pth.relative_to(self.cwd)
+		hsh = Memories.get_checksum(pth)
+		dat = Memories.get_datetime(pth)
 
-		if hsh in self.trash_set:
-			return (hsh, ".trash", dat, src, None)
+		rel = pth.relative_to(data_dir)
 
-		suf = src_pth.suffix.lower()
-		suf = self.replace_map.get(suf, suf)
+		suf = pth.suffix.lower()
+		suf = Memories.replace_map.get(suf, suf)
 
-		if dat is None:
-			dst_pth = src_pth.parent / f"{src_pth.fname}.{hsh[:16]}{suf}"
-		else:
-			dst_pth = src_pth.parent / f"{dat}.{hsh[:6]}{suf}"
+		mtime = pth.stat().st_mtime
 
-		dst = dst_pth.relative_to(self.cwd)
+		return RenameFile(rel, suf, dat, hsh, mtime)
 
-		if hsh in self.private_set:
-			return (hsh, ".private", dat, src, dst)
-		else:
-			return (hsh, ".", dat, src, dst)
+		# if hsh in self.trash_set:
+		# 	return (hsh, ".trash", dat, src, None)
 
-	def scan_dir(self):
+		# if dat is None:
+		# 	dst_pth = src_pth.parent / f"{src.fname}.{hsh[:16]}{suf}"
+		# else:
+		# 	dst_pth = src_pth.parent / f"{dat}.{hsh[:6]}{suf}"
+
+		# dst = dst_pth.relative_to(self.cwd)
+
+		# if hsh in self.private_set:
+		# 	return (hsh, ".private", dat, src, dst)
+		# else:
+		# 	return (hsh, None, dat, src, dst)
+
+	def scan_dir(self, pth=None):
+		if pth is None:
+			pth = data_dir
+
 		t_start = time.perf_counter_ns()
-		p_gen = self.cwd.iter_on_suffix(*self.suffix_set)
 
-		self.f_map = collections.defaultdict(list)
+		p_gen = pth.iter_on_suffix(*self.suffix_set)
 
 		i = 0
 		with ThreadPoolExecutor() as pool:
-			for hsh, sub, dat, src, dst in pool.map(self.scan_file, p_gen):
-				self.f_map[hsh].append((sub, dat, src, dst))
+			for obj in pool.map(Memories.get_file, p_gen):
+				self.f_map[obj.hsh].append(obj)
 				i += 1
 
 		t_stop = time.perf_counter_ns()
 
-		print(f"scan {i} files in {int((t_stop - t_start) / 1e6)}ms")
+		print(f"scanned {i} files in {int((t_stop - t_start) / 1e6)}ms")
+
+	def rename(self, src: Path, dst: Path, dry_run=True):
+		"""
+		les chemins doivent être relatifs à data_dir
+		"""
+		print(f"{src} -> {dst}")
+		if not dry_run:
+			src = (data_dir / src).resolve(strict=True)
+			dst = (data_dir / dst).resolve()
+
+			if dst.is_file():
+				src_bin = src.read_bytes()
+				dst_bin = dst.read_bytes()
+				if src_bin != dst_bin:
+					pass
+			(data_dir / src).rename(data_dir / dst)
 
 	def process(self, dry_run=True):
-		logger = setup_logger("rename", log_file=None if dry_run else self.log_pth)
+		if dry_run:
+			logger = setup_logger("rename")
+		else:
+			logger = setup_logger("rename", self.log_pth, to_stdout=False)
+
 		for key in self.f_map:
 			for i, elem in enumerate(self.f_map[key]):
 				sub, dat, src, dst = elem
-				if dst is None:
-					logger.info(f"{key}\t{sub}\t{dat}\t{src} \x1b[31m--X\x1b[0m")
-					continue
-				if i == 0:
-					logger.info(f"{key}\t{sub}\t{dat}\t{src} \x1b[32m-->\x1b[0m {dst}")
+
+				if sub is not None:
+					logger.info(f"{key}\t{sub}\t{dat}\t{src} \x1b[31m--X\x1b[0m {sub}")
 				else:
-					logger.info(
-						f"{key}\t{sub}\t{dat}\t{src} \x1b[33m<->\x1b[0m {self.f_map[key][0][1]}"
-					)
+					if i == 0:
+						logger.info(
+							f"{key}\t{sub}\t{dat}\t{src} \x1b[32m-->\x1b[0m {dst}"
+						)
+					else:
+						sub = ".duplicate"
+						logger.info(
+							f"{key}\t{sub}\t{dat}\t{src} \x1b[33m<->\x1b[0m {self.f_map[key][0][2]}"
+						)
+				if not dry_run:
+					if sub is None:
+						print(f"{src} -> {dst}")
+						(self.cwd / src).rename(self.cwd / dst)
+					else:
+						print(f"{src} -> {sub}/{dst.fname}.{key}{dst.suffix}")
+						(self.cwd / src).rename(
+							data_dir / sub / f"{dst.fname}.{key}{dst.suffix}"
+						)
