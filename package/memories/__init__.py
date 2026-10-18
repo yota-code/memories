@@ -51,6 +51,12 @@ class RenameFile:
 	hsh: str = None
 	mtime: float = None
 
+	def name(self) :
+		if self.dat :
+			return self.rel.parent / f"{self.rel.fname}.{self.hsh[:16]}{self.suf}"
+		else:
+			return self.rel.parent / f"{self.dat}.{self.hsh[:6]}{self.suf}"
+
 
 class RenameStatus(enum.Enum):
 	DONE = 0
@@ -64,7 +70,7 @@ hash16_rec = re.compile(r"^[A-Z2-7]{16}$")
 processed_rec = re.compile(r"^[0-9]{8}_[0-9]{6}\.[A-Z2-7]{6}$")
 
 
-class Memories:
+class MemoriesRename:
 	# and videos
 
 	suffix_set = frozenset({".jpg", ".jpeg", ".png", ".mp4", ".mov"})
@@ -75,8 +81,7 @@ class Memories:
 		if not (data_dir / ".memories").is_dir():
 			(data_dir / ".memories").make_dirs()
 
-		self.trash_pth, self.trash_set = self.setup_list("trash")
-		self.private_pth, self.private_set = self.setup_list("private")
+		self.l_map = {k: self.setup_list(k) for k in ["trash", "private"]}
 
 		(data_dir / "_collision").make_dirs()
 
@@ -86,7 +91,12 @@ class Memories:
 		self.scan_dir(data_dir / ".private")
 
 	def setup_list(self, name):
+		"""un fichier .memories/_<name> contient la liste des hash
+		tout fichier déjà présent dans le dossier correspondant est inscrit dans la liste
+		tout fichier scanné matchant est déplacé dans le dossier correspondant
+		"""
 		list_pth = data_dir / ".memories" / f"_{name}"
+
 		if not list_pth.is_file():
 			list_pth.write_text("")
 			list_set = set()
@@ -99,7 +109,7 @@ class Memories:
 
 		list_dir = data_dir / f".{name}"
 
-		# on récupère les fichiers présents dans les sous dossiers pour compléter les listes
+		# on récupère les hash des fichiers présents dans les sous dossiers pour compléter les listes
 		list_dir.make_dirs()
 		for suf in self.suffix_set:
 			for pth in list_dir.glob("*" + suf):
@@ -109,7 +119,7 @@ class Memories:
 
 		return list_pth, list_set
 
-	def write_list(self, name, item):
+	def add_to_list(self, name, item):
 		list_pth = data_dir / ".memories" / f"_{name}"
 		with list_pth.open("at") as fid:
 			fid.write(item + "\n")
@@ -148,15 +158,15 @@ class Memories:
 		)
 
 	@staticmethod
-	def get_file(pth: Path):
+	def get_file_info(pth: Path):
 
-		hsh = Memories.get_checksum(pth)
-		dat = Memories.get_datetime(pth)
+		hsh = MemoriesRename.get_checksum(pth)
+		dat = MemoriesRename.get_datetime(pth)
 
 		rel = pth.relative_to(data_dir)
 
 		suf = pth.suffix.lower()
-		suf = Memories.replace_map.get(suf, suf)
+		suf = MemoriesRename.replace_map.get(suf, suf)
 
 		mtime = pth.stat().st_mtime
 
@@ -183,11 +193,13 @@ class Memories:
 
 		t_start = time.perf_counter_ns()
 
-		p_gen = pth.iter_on_suffix(*self.suffix_set)
+		p_gen = pth.iter_on_suffix(
+			*self.suffix_set,
+		)
 
 		i = 0
 		with ThreadPoolExecutor() as pool:
-			for obj in pool.map(Memories.get_file, p_gen):
+			for obj in pool.map(MemoriesRename.get_file, p_gen):
 				self.f_map[obj.hsh].append(obj)
 				i += 1
 
@@ -195,7 +207,7 @@ class Memories:
 
 		print(f"scanned {i} files in {int((t_stop - t_start) / 1e6)}ms")
 
-	def rename(self, src: Path, dst: Path, dry_run=True):
+	def apply(self, src: Path, dst: Path, dry_run=True):
 		"""
 		les chemins doivent être relatifs à data_dir
 		"""
@@ -217,12 +229,28 @@ class Memories:
 		else:
 			logger = setup_logger("rename", self.log_pth, to_stdout=False)
 
-		for key in self.f_map:
-			for i, elem in enumerate(self.f_map[key]):
-				sub, dat, src, dst = elem
+		for hsh, o_lst in self.f_map.items():
+			is_in_list = False
+			for l, (l_pth, l_set) in self.l_map.items() :
+				if hsh in l_set :
+					is_in_list = True
+					for obj in o_lst :
+						logger.info(f"{obj.hsh}\t{obj.rel} \x1b[31m--X\x1b[0m {l}")
+			if is_in_list : 
+				continue
+			for i, obj in enumerate(o_lst) :
+				logger.info(
+						f"{key}\t{sub}\t{dat}\t{src} \x1b[32m-->\x1b[0m {dst}"
+				)
 
-				if sub is not None:
-					logger.info(f"{key}\t{sub}\t{dat}\t{src} \x1b[31m--X\x1b[0m {sub}")
+
+			for i, obj in enumerate(self.f_map[key]):
+				for l, (l_pth, l_set) in self.l_map.items() :
+					if obj.hsh in l_set :
+						logger.info(f"{obj.hsh}\t{obj.src} \x1b[31m--X\x1b[0m {l}")
+						self.apply(obj.src, l_pth / )
+				elif obj.hsh in self.private_set:
+					logger.info(f"{obj.hsh}\t{obj.src} \x1b[31m--.\x1b[0m")
 				else:
 					if i == 0:
 						logger.info(
