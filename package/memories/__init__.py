@@ -32,10 +32,21 @@ data_dir/
 	public/
 	.private/
 	upload/
-	_collision/
 	.memories/
 	.trash/
+
+
+on part de l'hypothèse que le hash complet est unique, et que les fichiers avec le même hash sont forcément identiques et réciproquement
 """
+
+dir_map = {
+	"upload": "upload",  # dossier dans lequel on met les fichiers à traiter
+	"public": "public",
+	"private": ".private",
+	"collision": "_collision",  # dossier dans lequel on met les fichiers qui ont le même hash mais un contenu différent
+	"unshared": "_unshared",  # picture not especially private, but not interesting enough to be shared
+	"trash": ".trash",
+}
 
 
 def setup_logger(name, log_file=None, to_stdout=True, level=logging.INFO):
@@ -57,20 +68,28 @@ def setup_logger(name, log_file=None, to_stdout=True, level=logging.INFO):
 @dataclasses.dataclass(slots=True)
 class RenameFile:
 	pot: str  # bucket name
-	rel: Path  # path relative to data_dir
+	rel: Path  # path relative to data_dir/pot
 	suf: str = None
 	dat: str = None
 	hsh: str = None
 	mtime: float = None
 
-	def name(self):
-		if self.dat:
-			return f"{self.rel.fname}.{self.hsh[:16]}{self.suf}"
-		else:
-			return f"{self.dat}.{self.hsh[:6]}{self.suf}"
+	def src_absolute(self):
+		return data_dir / self.pot / self.rel
 
-	def full(self):
-		return f"{self.hsh}{self.suf}"
+	def dst_name(self, anomymous=False):
+		if anomymous:
+			return f"{self.hsh}{self.suf}"
+		if self.dat:
+			return f"{self.dat}.{self.hsh[:6]}{self.suf}"
+		else:
+			return f"{self.rel.fname}.{self.hsh[:16]}{self.suf}"
+
+	def dst_relative(self, anomymous=False):
+		return self.rel.parent / self.dst_name(anomymous)
+
+	def dst_absolute(self, pot, anomymous=False):
+		return data_dir / pot / self.dst_relative(anomymous)
 
 
 class RenameStatus(enum.Enum):
@@ -91,48 +110,43 @@ class Memories:
 	suffix_set = frozenset({".jpg", ".jpeg", ".png", ".mp4", ".mov"})
 	replace_map = {".jpeg": ".jpg"}
 
-	d_map = {
-		"upload": "upload",
-		"public": "public",
-		"private": ".private",
-		"collision": "_collision",
-		"unshared": "_unshared",  # picture not especially private, but not interesting enough to be shared
-		"trash": ".trash",
-	}
-
 	def __init__(self):
 
-		for v in self.d_map.values():
+		for v in dir_map.values():
 			(data_dir / v).make_dirs()
 
 		self.memories_dir = data_dir / ".memories"
 		self.memories_dir.make_dirs()
 
-		self.l_map = {k: self.setup_list(k) for k in ["private", "unshared", "trash"]}
+		self.log_pth = self.memories_dir / "rename.log"
 
 		self.f_map = collections.defaultdict(list)
+		self.b_map = collections.defaultdict(dict)
 
-		for v in self.d_map.values():
-			self.scan_dir(data_dir / v)
+		for k in dir_map:
+			self.scan(k)
+
+		self.l_map = {k: self.setup_list(k) for k in ["private", "unshared", "trash"]}
 
 		self.trash_dir.delete_content()
 
 		Path(data_dir / "f_map.json").save(self.f_map, verbose=True)
+		Path(data_dir / "b_map.json").save(self.b_map, verbose=True)
 
 	def __getattr__(self, name):
-		if name.endswith("_dir") and name[:-4] in self.d_map:
-			return data_dir / self.d_map[name[:-4]]
+		if name.endswith("_dir") and name[:-4] in dir_map:
+			return data_dir / dir_map[name[:-4]]
 		else:
 			raise AttributeError(
 				f"{name} is not a valid attribute of class {self.__class__.__name__}"
 			)
 
-	def setup_list(self, name, prefix=""):
+	def setup_list(self, pot):
 		"""un fichier .memories/_<name> contient la liste des hash
 		tout fichier déjà présent dans le dossier correspondant est inscrit dans la liste
 		tout fichier scanné matchant est déplacé dans le dossier correspondant
 		"""
-		list_pth = self.memories_dir / f"{name}.lst"
+		list_pth = self.memories_dir / f"{pot}.lst"
 
 		if not list_pth.is_file():
 			list_pth.write_text("")
@@ -144,22 +158,22 @@ class Memories:
 				if line.strip()
 			}
 
-		list_dir = data_dir / f".{name}"
-
 		# on récupère les hash des fichiers présents dans les sous dossiers pour compléter les listes
-		list_dir.make_dirs()
-		for suf in self.suffix_set:
-			for pth in list_dir.glob("*" + suf):
-				list_set.add(self.get_checksum(pth))
+		for rel in self.b_map[pot]:
+			obj = self.b_map[pot][rel]
+			list_set.add(obj.hsh)
 
 		list_pth.write_text("\n".join(sorted(list_set)))
+		print(list_pth.relative_to(data_dir), "contains", len(list_set), "hashes")
 
 		return list_pth, list_set
 
 	@staticmethod
 	def get_checksum(pth):
+		xx3 = xxhash.xxh3_128()
 		with pth.open("rb") as fid:
-			xx3 = xxhash.xxh3_128(fid.read())
+			while chunk := fid.read(2**24):
+				xx3.update(chunk)
 		hsh = xx3.digest()
 		b32 = base64.b32encode(hsh).decode("ascii")[:24]
 		return b32 + f"_{pth.stat().st_size & 0xFF_FFFF:06X}"
@@ -174,7 +188,7 @@ class Memories:
 			["exiftool", str(pth)], stdout=subprocess.PIPE, check=False
 		)
 		for line in ret.stdout.decode("utf8", errors="replace").splitlines():
-			key, sep, value = line.partition(":")
+			key, _, value = line.partition(":")
 			if "Create Date" == key.strip():
 				try:
 					return datetime.datetime.strptime(
@@ -191,7 +205,7 @@ class Memories:
 		dat = Memories.get_datetime(pth)
 
 		rel = pth.relative_to(data_dir).parts
-		pot = rel[0] if rel else ""
+		pot = rel[0].removeprefix(".").removeprefix("_") if rel else ""
 		rel = Path(*rel[1:])
 
 		suf = pth.suffix.lower()
@@ -201,96 +215,72 @@ class Memories:
 
 		return RenameFile(pot, rel, suf, dat, hsh, mtime)
 
-	def scan_dir(self, pth=None):
-		if pth is None:
-			pth = data_dir
+	def scan(self, pot: str):
+
+		print(f"scan({pot})")
 
 		t_start = time.perf_counter_ns()
 
-		p_gen = pth.iter_on_suffix(
-			*self.suffix_set,
-		)
+		pth_gen = (data_dir / dir_map[pot]).iter_on_suffix(*self.suffix_set)
 
 		i = 0
 		with ThreadPoolExecutor() as pool:
-			for obj in pool.map(Memories.get_file_info, p_gen):
-				self.f_map[obj.hsh].append(obj)
+			for obj in pool.map(Memories.get_file_info, pth_gen):
+				if obj.pot not in {"upload"}:
+					self.f_map[obj.hsh].append(obj)
+				self.b_map[obj.pot][str(obj.rel)] = obj
 				i += 1
 
 		t_stop = time.perf_counter_ns()
 
 		print(
-			f"scanned {i} files in \x1b[33m{pth.relative_to(data_dir)}\x1b[0m, took {int((t_stop - t_start) / 1e6)}ms"
+			f"scanned {i} files in \x1b[33m{dir_map[pot]}\x1b[0m, took {int((t_stop - t_start) / 1e6)}ms"
 		)
 
-	def move(self, src: Path, dst: Path, bucket: str, dry_run=True):
+	def move(self, obj: RenameFile, pot: str, dry_run=True):
 		"""
 		les chemins doivent être relatifs à data_dir
 		"""
-		assert bucket in self.d_map, f"{bucket} is not a valid bucket"
+		assert pot in dir_map, f"{pot} is not a valid bucket"
 
-		print(f"{src} -> {dst}")
+		src = obj.src_absolute()
+
+		to_anon = pot in {"collision", "trash"}
+
+		dst = obj.dst_absolute(pot, to_anon)
+
 		if not dry_run:
-			src = (data_dir / src).resolve(strict=True)
-			dst = (data_dir / dst).resolve()
+			try:
+				tgt = self.b_map[pot][str(obj.dst_relative())]
+				print("collision --------")
+				print(obj)
+				print(tgt)
 
-			if dst.is_file():
-				src_bin = src.read_bytes()
-				dst_bin = dst.read_bytes()
-				if src_bin != dst_bin:
-					pass
-			(data_dir / src).rename(data_dir / dst)
+			except KeyError:
+				pass
+
+			self.b_map[pot][str(obj.dst_relative())] = self.b_map[obj.pot].pop(
+				str(obj.rel)
+			)
+
+		self.logger.info(
+			f"{obj.hsh}\t{src.relative_to(data_dir)} -> {dst.relative_to(data_dir)}"
+		)
 
 	def process(self, dry_run=True):
+		"""seuls les fichiers présents dans le dossier upload sont traités"""
 		if dry_run:
-			logger = setup_logger("rename")
+			self.logger = setup_logger("rename")
 		else:
-			logger = setup_logger("rename", self.log_pth, to_stdout=False)
+			self.logger = setup_logger("rename", self.log_pth, to_stdout=False)
 
-		for hsh, o_lst in self.f_map.items():
-			is_special = False
-			for l, (l_pth, l_set) in self.l_map.items():
+		for pth in list(self.b_map["upload"]):
+			obj = self.b_map["upload"][pth]
+
+			for pot, (l_pth, l_set) in self.l_map.items():
 				# on teste voir si le hash est dans une des listes spéciales: private, unshared ou trash
-				if hsh in l_set:
-					is_special = True
-					for i, obj in enumerate(o_lst):
-						# si c'est le cas, on bouge chaque instance dans le dossier correspondant
-						logger.info(f"{obj.hsh}\t{obj.rel} \x1b[31m--X\x1b[0m {l}")
-						if i == 1:
-							self.move(obj.rel, obj.name, l, dry_run)
-						else:
-							self.move(obj.rel, obj.full, "collision", dry_run)
-					# seulement la première liste qui matche est considérée, on ne teste pas les autres listes
+				if obj.hsh in l_set:
+					self.move(obj, pot, dry_run)
 					break
-			if is_special:
-				continue
-
-			for i, obj in enumerate(o_lst):
-				logger.info(f"{obj.hsh}\t{sub}\t{dat}\t{src} \x1b[32m-->\x1b[0m {dst}")
-
-			for i, obj in enumerate(self.f_map[key]):
-				for l, (l_pth, l_set) in self.l_map.items():
-					if obj.hsh in l_set:
-						logger.info(f"{obj.hsh}\t{obj.src} \x1b[31m--X\x1b[0m {l}")
-						self.apply(obj.src, l_pth)
-				if obj.hsh in self.l_map[private][1]:
-					logger.info(f"{obj.hsh}\t{obj.src} \x1b[31m--.\x1b[0m")
-				else:
-					if i == 0:
-						logger.info(
-							f"{key}\t{sub}\t{dat}\t{src} \x1b[32m-->\x1b[0m {dst}"
-						)
-					else:
-						sub = ".duplicate"
-						logger.info(
-							f"{key}\t{sub}\t{dat}\t{src} \x1b[33m<->\x1b[0m {self.f_map[key][0][2]}"
-						)
-				if not dry_run:
-					if sub is None:
-						print(f"{src} -> {dst}")
-						(self.cwd / src).rename(self.cwd / dst)
-					else:
-						print(f"{src} -> {sub}/{dst.fname}.{key}{dst.suffix}")
-						(self.cwd / src).rename(
-							data_dir / sub / f"{dst.fname}.{key}{dst.suffix}"
-						)
+			else:
+				self.move(obj, "public", dry_run)
