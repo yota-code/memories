@@ -4,7 +4,7 @@
 from memories import Memories
 
 u = Memories()
-# u.process()
+u.process()
 
 # z = input("apply changes ? ")
 # if z.lower() in ("y", "yes"):
