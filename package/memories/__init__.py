@@ -48,6 +48,8 @@ dir_map = {
 	"trash": ".trash",
 }
 
+anon_set = {"collision", "trash"}
+
 
 def setup_logger(name, log_file=None, to_stdout=True, level=logging.INFO):
 	logger = logging.getLogger(name)
@@ -68,28 +70,22 @@ def setup_logger(name, log_file=None, to_stdout=True, level=logging.INFO):
 @dataclasses.dataclass(slots=True)
 class RenameFile:
 	pot: str  # bucket name
-	rel: Path  # path relative to data_dir/pot
+	rel: str  # path relative to data_dir/pot
+	nam: str  # juste le nom brut, sans le suffixe, sans le hash
 	suf: str = None
 	dat: str = None
 	hsh: str = None
-	mtime: float = None
 
-	def src_absolute(self):
-		return data_dir / self.pot / self.rel
+	def resolve(self):
+		return data_dir / self.pot / self.rel / self.name
 
-	def dst_name(self, anomymous=False):
-		if anomymous:
+	def name(self):
+		if self.pot in anon_set:
 			return f"{self.hsh}{self.suf}"
 		if self.dat:
 			return f"{self.dat}.{self.hsh[:6]}{self.suf}"
 		else:
 			return f"{self.rel.fname}.{self.hsh[:16]}{self.suf}"
-
-	def dst_relative(self, anomymous=False):
-		return self.rel.parent / self.dst_name(anomymous)
-
-	def dst_absolute(self, pot, anomymous=False):
-		return data_dir / pot / self.dst_relative(anomymous)
 
 
 class RenameStatus(enum.Enum):
@@ -121,6 +117,8 @@ class Memories:
 		self.log_pth = self.memories_dir / "rename.log"
 
 		self.f_map = collections.defaultdict(list)
+
+		# b_map[obj.pot][str(obj.rel)] = obj
 		self.b_map = collections.defaultdict(dict)
 
 		for k in dir_map:
@@ -216,7 +214,7 @@ class Memories:
 		return RenameFile(pot, rel, suf, dat, hsh, mtime)
 
 	def scan(self, pot: str):
-
+		"""démarre un scan"""
 		print(f"scan({pot})")
 
 		t_start = time.perf_counter_ns()
@@ -228,7 +226,7 @@ class Memories:
 			for obj in pool.map(Memories.get_file_info, pth_gen):
 				if obj.pot not in {"upload"}:
 					self.f_map[obj.hsh].append(obj)
-				self.b_map[obj.pot][str(obj.rel)] = obj
+				self.b_map[obj.pot][obj.name] = obj
 				i += 1
 
 		t_stop = time.perf_counter_ns()
@@ -239,22 +237,18 @@ class Memories:
 
 	def move(self, obj: RenameFile, pot: str, dry_run=True):
 		"""
-		les chemins doivent être relatifs à data_dir
+		on prend un obj et on le copie dans le pot
 		"""
+
 		assert pot in dir_map, f"{pot} is not a valid bucket"
 
 		src = obj.src_absolute()
 
-		to_anon = pot in {"collision", "trash"}
-
-		dst = obj.dst_absolute(pot, to_anon)
+		dst = obj.replace(pot=pot)
 
 		if not dry_run:
 			try:
-				tgt = self.b_map[pot][str(obj.dst_relative())]
-				print("collision --------")
-				print(obj)
-				print(tgt)
+				tgt = obj.replace(obj, rel=dst.relative_to)
 
 			except KeyError:
 				pass
