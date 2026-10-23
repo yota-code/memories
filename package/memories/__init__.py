@@ -46,6 +46,7 @@ dir_map = {
 	"collision": "_collision",  # dossier dans lequel on met les fichiers qui ont le même hash mais un contenu différent
 	"unshared": "_unshared",  # picture not especially private, but not interesting enough to be shared
 	"trash": ".trash",
+	None: "",
 }
 
 anon_set = {"collision", "trash"}
@@ -71,21 +72,96 @@ def setup_logger(name, log_file=None, to_stdout=True, level=logging.INFO):
 class RenameFile:
 	pot: str  # bucket name
 	rel: str  # path relative to data_dir/pot
-	nam: str  # juste le nom brut, sans le suffixe, sans le hash
+	stm: str  # juste le nom brut, sans le suffixe, sans le hash
 	suf: str = None
 	dat: str = None
 	hsh: str = None
 
+	def __hash__(self):
+		return self.hsh
+
 	def resolve(self):
 		return data_dir / self.pot / self.rel / self.name
 
+	@property
 	def name(self):
 		if self.pot in anon_set:
 			return f"{self.hsh}{self.suf}"
 		if self.dat:
 			return f"{self.dat}.{self.hsh[:6]}{self.suf}"
 		else:
-			return f"{self.rel.fname}.{self.hsh[:16]}{self.suf}"
+			return f"{self.stm}.{self.hsh[:16]}{self.suf}"
+
+
+class RenameFolder:
+	def __init__(self):
+		self.__cache__ = {}
+
+		self.file_lst = self.scan()
+
+		self.check_for_collisions()
+
+	def check_for_collisions(self):
+		"""le plus gros défi c'est 2 fichiers qui auraient le même .name mais pas le même hash..."""
+		p_map = self.sorted_by_nam_hsh()
+		for nam, q_map in p_map.items():
+			if len(q_map) != 1:
+				print("collision for:")
+				for hsh, obj in q_map.items():
+					print("hsh", obj.resolve())
+
+	def scan(self):
+		"""démarre un scan"""
+
+		t_start = time.perf_counter_ns()
+
+		pth_gen = data_dir.iter_on_suffix(*self.suffix_set)
+
+		with ThreadPoolExecutor() as pool:
+			f_lst = [obj for obj in pool.map(self.file_info, pth_gen)]
+
+		t_stop = time.perf_counter_ns()
+
+		print(
+			f"scanned {len(f_lst)} files in \x1b[33m{dir_map[pot]}\x1b[0m, took {int((t_stop - t_start) / 1e6)}ms"
+		)
+
+		return f_lst
+
+	@staticmethod
+	def file_info(pth: Path):
+
+		pth = pth.resolve(strict=True)
+
+		hsh = Memories.get_checksum(pth)
+		dat = Memories.get_datetime(pth)
+
+		p_lst = pth.relative_to(data_dir).parts
+		pot = p_lst[0].lstrip("._")
+		rel = Path(*p_lst[1:-1])
+
+		nam = pth.fname
+
+		suf = pth.suffix.lower()
+		suf = Memories.replace_map.get(suf, suf)
+
+		return RenameFile(pot, rel, nam, suf, dat, hsh)
+
+	def sorted_by_pot(self):
+		if "sorted_by_pot" not in self.__cache__:
+			p_map = collections.defaultdict(set)
+			for obj in self.file_lst:
+				p_map[obj.pot].add(obj)
+			self.__cache__["sorted_by_pot"] = p_map
+		return self.__cache__["sorted_by_pot"]
+
+	def sorted_by_name_hsh(self):
+		if "sorted_by_nam_hsh" not in self.__cache__:
+			p_map = collections.defaultdict(dict)
+			for obj in self.file_lst:
+				p_map[obj.nam][obj.hsh] = obj
+			self.__cache__["sorted_by_nam_hsh"] = p_map
+		return self.__cache__["sorted_by_nam_hsh"]
 
 
 class RenameStatus(enum.Enum):
@@ -116,20 +192,13 @@ class Memories:
 
 		self.log_pth = self.memories_dir / "rename.log"
 
-		self.f_map = collections.defaultdict(list)
-
-		# b_map[obj.pot][str(obj.rel)] = obj
-		self.b_map = collections.defaultdict(dict)
-
-		for k in dir_map:
-			self.scan(k)
+		self.folder = RenameFolder()
 
 		self.l_map = {k: self.setup_list(k) for k in ["private", "unshared", "trash"]}
 
 		self.trash_dir.delete_content()
 
-		Path(data_dir / "f_map.json").save(self.f_map, verbose=True)
-		Path(data_dir / "b_map.json").save(self.b_map, verbose=True)
+		Path(data_dir / "p_map.json").save(self.p_map, verbose=True)
 
 	def __getattr__(self, name):
 		if name.endswith("_dir") and name[:-4] in dir_map:
@@ -157,11 +226,11 @@ class Memories:
 			}
 
 		# on récupère les hash des fichiers présents dans les sous dossiers pour compléter les listes
-		for rel in self.b_map[pot]:
-			obj = self.b_map[pot][rel]
+		for obj in self.scan(pot):
 			list_set.add(obj.hsh)
 
 		list_pth.write_text("\n".join(sorted(list_set)))
+
 		print(list_pth.relative_to(data_dir), "contains", len(list_set), "hashes")
 
 		return list_pth, list_set
@@ -196,24 +265,7 @@ class Memories:
 					pass
 		return None
 
-	@staticmethod
-	def get_file_info(pth: Path):
-
-		hsh = Memories.get_checksum(pth)
-		dat = Memories.get_datetime(pth)
-
-		rel = pth.relative_to(data_dir).parts
-		pot = rel[0].removeprefix(".").removeprefix("_") if rel else ""
-		rel = Path(*rel[1:])
-
-		suf = pth.suffix.lower()
-		suf = Memories.replace_map.get(suf, suf)
-
-		mtime = pth.stat().st_mtime
-
-		return RenameFile(pot, rel, suf, dat, hsh, mtime)
-
-	def scan(self, pot: str):
+	def scan(self, pot: str = None):
 		"""démarre un scan"""
 		print(f"scan({pot})")
 
@@ -221,19 +273,16 @@ class Memories:
 
 		pth_gen = (data_dir / dir_map[pot]).iter_on_suffix(*self.suffix_set)
 
-		i = 0
 		with ThreadPoolExecutor() as pool:
-			for obj in pool.map(Memories.get_file_info, pth_gen):
-				if obj.pot not in {"upload"}:
-					self.f_map[obj.hsh].append(obj)
-				self.b_map[obj.pot][obj.name] = obj
-				i += 1
+			f_lst = [obj for obj in pool.map(Memories.get_file_info, pth_gen)]
 
 		t_stop = time.perf_counter_ns()
 
 		print(
-			f"scanned {i} files in \x1b[33m{dir_map[pot]}\x1b[0m, took {int((t_stop - t_start) / 1e6)}ms"
+			f"scanned {len(f_lst)} files in \x1b[33m{dir_map[pot]}\x1b[0m, took {int((t_stop - t_start) / 1e6)}ms"
 		)
+
+		return f_lst
 
 	def move(self, obj: RenameFile, pot: str, dry_run=True):
 		"""
