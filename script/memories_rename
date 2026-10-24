@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 
+from memories.rename import MemoriesRename
 
-from memories import Memories
-
-u = Memories()
-u.process(dry_run=False)
+u = MemoriesRename()
+u.process()
 
 
 # z = input("apply changes ? ")
