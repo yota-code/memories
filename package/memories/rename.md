@@ -223,3 +223,57 @@ find /chemin/vers/images -type f -print0 | xargs -0 exiftool -j -CreateDate
 | **Shell pur (`find` + `exiftool`)** | Performance maximale, aucune allocation de mémoire intermédiaire en Python, idéal pour les scripts d'administration système. | Nécessite de parser la sortie JSON directement en shell (via `jq`) ou de réimporter les données en Python par la suite. |
 
 Pour une architecture applicative orientée objet en Python (comme l'indique l'utilisation d'une propriété `self.dat`), la persistance du fichier temporaire via le module `tempfile` conserve l'encapsulation tout en garantissant des performances optimales pour plusieurs milliers d'images.
+
+Lorsque `find` découpe une liste de fichiers en plusieurs lots via l'option `-exec ... +`, il exécute `exiftool` séquentiellement. Chaque exécution produit un tableau JSON indépendant (`[ ... ]`).
+
+La sortie standard (`stdout`) globale contient donc une suite de tableaux JSON juxtaposés :
+
+```json
+[
+  {"SourceFile": "img1.jpg", "CreateDate": "2023:01:01 12:00:00"}
+][
+  {"SourceFile": "img2.jpg", "CreateDate": "2023:01:02 14:00:00"}
+]
+
+```
+
+Un flux de ce type n'est pas un document JSON unique valide au sens strict, ce qui provoque une erreur avec un `jq` naïf. Pour le traiter correctement et fusionner tous les lots en un **unique tableau JSON homogène**, il faut utiliser l'option **`-s` (slurp)** de `jq` associée à la fonction **`add`**.
+
+### La commande complète
+
+```bash
+find /chemin/vers/images -type f -exec exiftool -j -CreateDate {} + | jq -s 'add'
+
+```
+
+### Explication détaillée du traitement par `jq` :
+
+1. **Le mode `-s` (slurp)** : Il indique à `jq` de ne pas traiter chaque flux JSON séparément au vol, mais de "gober" (**to slurp**) l'intégralité des entrées pour les regrouper dans un grand tableau global. Le résultat intermédiaire devient un tableau de tableaux :
+```json
+[
+  [{"SourceFile": "img1.jpg", ...}],
+  [{"SourceFile": "img2.jpg", ...}]
+]
+
+```
+
+
+2. **La fonction `add**` : Appliquée à ce tableau de tableaux, elle se charge de concaténer (aplatir) les sous-tableaux en un seul niveau. Le résultat final est un tableau unique contenant l'ensemble des objets de tous les lots :
+```json
+[
+  {"SourceFile": "img1.jpg", "CreateDate": "2023:01:01 12:00:00"},
+  {"SourceFile": "img2.jpg", "CreateDate": "2023:01:02 14:00:00"}
+]
+
+```
+
+
+
+### Variante : Filtrer directement dans `jq` pour ne garder que l'essentiel
+
+Si vous souhaitez alléger le flux de données en amont (par exemple, pour ne conserver que les chemins et les dates valides, ou formater directement la sortie), vous pouvez enchaîner les filtres dans le même appel `jq` :
+
+```bash
+find /chemin/vers/images -type f -exec exiftool -j -CreateDate {} + | jq -s 'add | map({path: .SourceFile, date: .CreateDate})'
+
+```
