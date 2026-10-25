@@ -287,6 +287,9 @@ class MemoriesRename:
 
 	def __init__(self):
 
+		self.pth_to_hsh_siz = {}
+		self.hsh_to_dat = {}
+
 		for v in dir_map.values():
 			(data_dir / v).make_dirs()
 
@@ -298,6 +301,10 @@ class MemoriesRename:
 		self.folder_map = {}
 
 	def process(self):
+
+		self.build_pth_to_hsh_siz()
+
+		return
 
 		for pot in dir_map:
 			self.folder_map[pot] = self.scan(pot)
@@ -343,14 +350,15 @@ class MemoriesRename:
 		return list_pth, list_set
 
 	@staticmethod
-	def get_checksum(pth):
+	def get_hsh_siz(pth):
 		xx3 = xxhash.xxh3_128()
 		with pth.open("rb") as fid:
 			while chunk := fid.read(2**24):
 				xx3.update(chunk)
 		hsh = xx3.digest()
 		b32 = base64.b32encode(hsh).decode("ascii")[:24]
-		return b32 + f"_{pth.stat().st_size & 0xFF_FFFF:06X}"
+		return pth, b32, pth.stat().st_size
+		# return b32 + f"_{pth.stat().st_size & 0xFF_FFFF:06X}"
 
 	@staticmethod
 	def get_datetime(pth):
@@ -372,26 +380,31 @@ class MemoriesRename:
 					pass
 		return None
 
-	def scan(self, pot: str):
+	def build_pth_to_hsh_siz(self):
 		"""démarre un scan"""
-		print(f"scan({pot})")
 
 		t_start = time.perf_counter_ns()
 
-		pth_gen = (data_dir / dir_map[pot]).iter_on_suffix(*suffix_set)
+		pth_gen = (data_dir).iter_on_suffix(*suffix_set, as_direntry=True)
+
+		def get_hsh_siz(dir_entry):
+			xx3 = xxhash.xxh3_128()
+			with open(dir_entry.path, "rb") as fid:
+				while chunk := fid.read(2**16):
+					xx3.update(chunk)
+			hsh = xx3.digest()
+			return dir_entry.path, hsh, dir_entry.stat().st_size
 
 		with ThreadPoolExecutor() as pool:
-			f_set = {
-				obj for obj in pool.map(lambda pth: RenameFile(pth).setup(), pth_gen)
+			self.pth_to_hsh_siz = {
+				pth: (hsh, siz) for pth, hsh, siz in pool.map(get_hsh_siz, pth_gen)
 			}
 
 		t_stop = time.perf_counter_ns()
 
 		print(
-			f"scanned {len(f_set)} files in \x1b[33m{dir_map[pot]}\x1b[0m, took {int((t_stop - t_start) / 1e6)}ms"
+			f"scanned {len(self.pth_to_hsh_siz)} files, took {int((t_stop - t_start) / 1e6)}ms"
 		)
-
-		return f_set
 
 	def move(self, obj: RenameFile, pot: str, dry_run=True):
 		"""

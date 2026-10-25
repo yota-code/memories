@@ -277,3 +277,124 @@ Si vous souhaitez alléger le flux de données en amont (par exemple, pour ne co
 find /chemin/vers/images -type f -exec exiftool -j -CreateDate {} + | jq -s 'add | map({path: .SourceFile, date: .CreateDate})'
 
 ```
+
+
+Oui, il est tout à fait possible d'exécuter cette ligne de commande depuis Python, mais sa présence d'un opérateur de canalisation (`|` pipe) nécessite une adaptation technique, car la fonction standard `subprocess.run` n'interprète pas les pipes par défaut.
+
+Deux approches permettent de réaliser cette exécution, suivies d'une analyse critique sur la portabilité de la solution.
+
+---
+
+### Méthode 1 : Utilisation de `shell=True` (La plus simple)
+
+L'argument `shell=True` indique à Python de confier la chaîne de caractères à un shell système (comme Bash), qui se chargera d'interpréter le pipe entre `find` et `jq`.
+
+```python
+import subprocess
+import json
+
+def get_images_metadata_shell(directory_path):
+    cmd = f"find {directory_path} -type f -exec exiftool -j -CreateDate {{}} + | jq -s 'add'"
+    
+    result = subprocess.run(
+        cmd,
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False
+    )
+    
+    if result.returncode == 0 and result.stdout.strip():
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError:
+            pass
+    return []
+
+```
+
+* **Avertissement de sécurité :** Cette méthode présente des risques d'injection de commande si le paramètre `directory_path` provient de données utilisateur non validées.
+
+---
+
+### Méthode 2 : Chaînage par `subprocess.Popen` (Sans `shell=True`)
+
+Pour éviter d'utiliser un sous-shell, il est possible de connecter directement la sortie standard du premier processus (`find`) à l'entrée standard du second (`jq`) en Python pur.
+
+```python
+import subprocess
+import json
+
+def get_images_metadata_popen(directory_path):
+    # 1. Lancement de find
+    p_find = subprocess.Popen(
+        ["find", directory_path, "-type", "f", "-exec", "exiftool", "-j", "-CreateDate", "{}", "+"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
+    
+    # 2. Lancement de jq connecté à la sortie de find
+    p_jq = subprocess.Popen(
+        ["jq", "-s", "add"],
+        stdin=p_find.stdout,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+    
+    # Fermeture du descripteur inutilisé dans le processus parent
+    p_find.stdout.close()
+    
+    # Récupération du résultat
+    output, err = p_jq.communicate()
+    
+    if p_jq.returncode == 0 and output.strip():
+        try:
+            return json.loads(output)
+        except json.JSONDecodeError:
+            pass
+            
+    return []
+
+```
+
+---
+
+### Analyse critique et alternative recommandée
+
+Bien que l'utilisation conjointe de `find` et `jq` soit fonctionnelle, elle présente un **inconvénient méthodologique majeur : la dépendance à la plateforme**.
+
+* La commande `find` et ses options (`-exec ... +`) ainsi que l'outil `jq` lient strictement votre code aux environnements **POSIX (Linux, macOS)**. Votre script planchera immédiatement sous Windows (où `find` désigne un équivalent obsolète de `grep`).
+* Puisque vous écrivez du code en Python (comme l'indique l'utilisation d'une propriété orientée objet `self.dat`), il est généralement préférable de déléguer la recherche de fichiers au module natif `pathlib`, qui est multiplateforme, puis de transmettre la liste via le fichier temporaire (`-@`) évoqué précédemment :
+
+```python
+from pathlib import Path
+import tempfile
+import subprocess
+import json
+
+def get_images_metadata_pure_python(root_dir):
+    # 1. Recherche récursive cross-platform en Python
+    paths = [str(p) for p in Path(root_dir).rglob("*") if p.is_file()]
+    if not paths:
+        return []
+
+    # 2. Utilisation d'un fichier temporaire pour ExifTool (robuste et universel)
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False) as tf:
+        tf.write("\n".join(paths))
+        tf_name = tf.name
+
+    try:
+        cmd = ["exiftool", "-j", "-CreateDate", f"-@{tf_name}"]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+        if result.returncode == 0:
+            return json.loads(result.stdout)
+    finally:
+        Path(tf_name).unlink(missing_ok=True)
+        
+    return []
+
+```
+
+Cette alternative purement en Python offre les performances du traitement par lot d'ExifTool tout en garantissant la portabilité du code sur tous les systèmes d'exploitation.
