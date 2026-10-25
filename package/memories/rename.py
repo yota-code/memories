@@ -9,11 +9,13 @@ import collections
 import dataclasses
 import datetime
 import enum
+import json
 import logging
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -21,6 +23,8 @@ import xxhash
 from cc_pathlib import Path
 
 data_dir = (Path(os.environ["MEMORIES_root_DIR"]) / "data").resolve(strict=True)
+data_len = len(str(data_dir)) + 1
+
 os.chdir(data_dir)
 
 assert data_dir.is_dir(), f"{data_dir} is not a directory"
@@ -280,6 +284,18 @@ vider la poubelle
 """
 
 
+def get_exif_date(pth_set):
+	with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False) as fid:
+		fid.write("\n".join(pth_set))
+		fid.flush()
+
+		ret = data_dir.run("exiftool", "-j", "-CreateDate", "-@", fid.name)
+		if ret.returncode == 0:
+			return json.loads(ret.stdout)
+
+	return []
+
+
 class MemoriesRename:
 	# and videos
 
@@ -287,7 +303,7 @@ class MemoriesRename:
 
 	def __init__(self):
 
-		self.pth_to_hsh_siz = {}
+		self.pth_to_hsh = {}
 		self.hsh_to_dat = {}
 
 		for v in dir_map.values():
@@ -302,8 +318,8 @@ class MemoriesRename:
 
 	def process(self):
 
-		self.build_pth_to_hsh_siz()
-
+		self.build_pth_to_hsh()
+		self.build_hsh_to_dat()
 		return
 
 		for pot in dir_map:
@@ -380,31 +396,68 @@ class MemoriesRename:
 					pass
 		return None
 
-	def build_pth_to_hsh_siz(self):
-		"""démarre un scan"""
+	def build_pth_to_hsh(self):
+		"""on itère sur tous les fichiers dont l'extension est dans suffix_set
+		et on récupère le hash et la taille du fichier
+
+		"""
+		print(">>> build_pth_to_hsh()")
 
 		t_start = time.perf_counter_ns()
 
 		pth_gen = (data_dir).iter_on_suffix(*suffix_set, as_direntry=True)
 
-		def get_hsh_siz(dir_entry):
+		def checksum(dir_entry):
 			xx3 = xxhash.xxh3_128()
 			with open(dir_entry.path, "rb") as fid:
 				while chunk := fid.read(2**16):
 					xx3.update(chunk)
 			hsh = xx3.digest()
-			return dir_entry.path, hsh, dir_entry.stat().st_size
+			hsh = base64.b32encode(hsh).decode("ascii")[:24]
+			siz = dir_entry.stat().st_size & 0xFF_FFFF
+			hsh = f"{hsh}_{siz:06X}"
+			return dir_entry.path[data_len:], hsh
 
 		with ThreadPoolExecutor() as pool:
-			self.pth_to_hsh_siz = {
-				pth: (hsh, siz) for pth, hsh, siz in pool.map(get_hsh_siz, pth_gen)
-			}
+			self.pth_to_hsh = {pth: hsh for pth, hsh in pool.map(checksum, pth_gen)}
 
 		t_stop = time.perf_counter_ns()
 
 		print(
-			f"scanned {len(self.pth_to_hsh_siz)} files, took {int((t_stop - t_start) / 1e6)}ms"
+			f"scanned {len(self.pth_to_hsh)} files, took {int((t_stop - t_start) / 1e6)}ms"
 		)
+
+	def build_hsh_to_dat(self):
+		cache_pth = self.memories_dir / "exif_date.tsv"
+
+		if cache_pth.is_file():
+			for hsh, dat in cache_pth.load():
+				self.hsh_to_dat[hsh] = dat if dat else None
+
+		hsh_to_pth = {
+			hsh: pth
+			for pth, hsh in self.pth_to_hsh.items()
+			if pth.partition("/")[0] not in {".trash", "_collision"}
+		}
+
+		new_hsh_set = hsh_to_pth.keys() - self.hsh_to_dat.keys()
+
+		if new_hsh_set:
+			print(len(new_hsh_set))
+			info_lst = get_exif_date({hsh_to_pth[hsh] for hsh in new_hsh_set})
+			for info in info_lst:
+				pth = info["SourceFile"]
+				dat = (
+					datetime.datetime.strptime(
+						info["CreateDate"], "%Y:%m:%d %H:%M:%S"
+					).strftime("%Y%m%d_%H%M%S")
+					if "CreateDate" in info
+					else None
+				)
+
+				self.hsh_to_dat[self.pth_to_hsh[pth]] = dat
+
+			cache_pth.save(sorted(self.hsh_to_dat.items()))
 
 	def move(self, obj: RenameFile, pot: str, dry_run=True):
 		"""
