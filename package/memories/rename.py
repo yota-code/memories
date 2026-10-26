@@ -306,6 +306,8 @@ class MemoriesRename:
 		self.pth_to_hsh = {}
 		self.hsh_to_dat = {}
 
+		self.bkt_to_pth = collections.defaultdict(set)
+
 		for v in dir_map.values():
 			(data_dir / v).make_dirs()
 
@@ -314,21 +316,22 @@ class MemoriesRename:
 
 		self.log_pth = self.memories_dir / "rename.log"
 
-		self.folder_map = {}
-
 	def process(self):
 
 		self.build_pth_to_hsh()
 		self.build_hsh_to_dat()
+		self.build_bkt_to_pth()
+
+		self.bkt_to_lst = {
+			bkt: self.setup_bucket_lst(bkt) for bkt in ["private", "unshared", "trash"]
+		}
+
 		return
 
 		for pot in dir_map:
 			self.folder_map[pot] = self.scan(pot)
 
 		# initialiser trash, private et unshare, récupérer le hash et compléter la liste
-		self.special_map = {
-			pot: self.setup_list(pot) for pot in ["private", "unshared", "trash"]
-		}
 
 	def __getattr__(self, name):
 		if name.endswith("_dir") and name[:-4] in dir_map:
@@ -338,12 +341,24 @@ class MemoriesRename:
 				f"{name} is not a valid attribute of class {self.__class__.__name__}"
 			)
 
-	def setup_list(self, pot):
+	def build_bkt_to_pth(self):
+		rev_map = {pre: bkt for bkt, pre in dir_map.items() if bkt is not None}
+		print(rev_map)
+		for pth in self.pth_to_hsh:
+			pre, _, post = pth.partition("/")
+			if pre in rev_map:
+				self.bkt_to_pth[rev_map[pre]].add(pth)
+			else:
+				self.bkt_to_pth[""].add(pth)
+
+		(self.memories_dir / "bkt_to_pth.json").save(self.bkt_to_pth, verbose=True)
+
+	def setup_bucket_lst(self, bkt):
 		"""un fichier .memories/_<name> contient la liste des hash
 		tout fichier déjà présent dans le dossier correspondant est inscrit dans la liste
 		tout fichier scanné matchant est déplacé dans le dossier correspondant
 		"""
-		list_pth = self.memories_dir / f"{pot}.lst"
+		list_pth = self.memories_dir / f"{bkt}.lst"
 
 		if not list_pth.is_file():
 			list_pth.write_text("")
@@ -356,8 +371,7 @@ class MemoriesRename:
 			}
 
 		# on récupère les hash des fichiers présents dans les sous dossiers pour compléter les listes
-		for obj in self.folder(pot):
-			list_set.add(obj.hsh)
+		list_set |= {self.pth_to_hsh[pth] for pth in self.bkt_to_pth[bkt]}
 
 		list_pth.write_text("\n".join(sorted(list_set)))
 
@@ -403,10 +417,6 @@ class MemoriesRename:
 		"""
 		print(">>> build_pth_to_hsh()")
 
-		t_start = time.perf_counter_ns()
-
-		pth_gen = (data_dir).iter_on_suffix(*suffix_set, as_direntry=True)
-
 		def checksum(dir_entry):
 			xx3 = xxhash.xxh3_128()
 			with open(dir_entry.path, "rb") as fid:
@@ -418,6 +428,9 @@ class MemoriesRename:
 			hsh = f"{hsh}_{siz:06X}"
 			return dir_entry.path[data_len:], hsh
 
+		t_start = time.perf_counter_ns()
+
+		pth_gen = data_dir.iter_on_suffix(*suffix_set, as_direntry=True)
 		with ThreadPoolExecutor() as pool:
 			self.pth_to_hsh = {pth: hsh for pth, hsh in pool.map(checksum, pth_gen)}
 
@@ -426,6 +439,7 @@ class MemoriesRename:
 		print(
 			f"scanned {len(self.pth_to_hsh)} files, took {int((t_stop - t_start) / 1e6)}ms"
 		)
+		(self.memories_dir / "pth_to_hsh.json").save(self.pth_to_hsh, verbose=True)
 
 	def build_hsh_to_dat(self):
 		cache_pth = self.memories_dir / "exif_date.tsv"
