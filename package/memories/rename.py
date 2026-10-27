@@ -6,15 +6,11 @@ sous manjaro, nécessite le paquet : exiftool
 
 import base64
 import collections
-import dataclasses
 import datetime
-import enum
 import json
-import logging
 import os
-import re
+import shutil
 import subprocess
-import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -46,219 +42,12 @@ dir_map = {
 	"upload": "upload",  # dossier dans lequel on met les fichiers à traiter
 	"public": "public",
 	"private": ".private",
-	"collision": "_collision",  # dossier dans lequel on met les fichiers qui ont le même hash mais un contenu différent
 	"unshared": "_unshared",  # picture not especially private, but not interesting enough to be shared
 	"trash": ".trash",
-	None: "",
 }
-
-anon_set = {"collision", "trash"}
-
 
 suffix_set = {".jpg", ".jpeg", ".png", ".mp4", ".mov"}
 suffix_map = {".jpeg": ".jpg"}
-
-
-def setup_logger(name, log_file=None, to_stdout=True, level=logging.INFO):
-	logger = logging.getLogger(name)
-	logger.setLevel(level)
-
-	if logger.hasHandlers():
-		logger.handlers.clear()
-
-	if to_stdout:
-		logger.addHandler(logging.StreamHandler(sys.stdout))
-
-	if log_file:
-		logger.addHandler(logging.FileHandler(log_file))
-
-	return logger
-
-
-@dataclasses.dataclass(slots=True)
-class RenameFileEUHH:
-	pot: str  # bucket name
-	rel: str  # path relative to data_dir/pot
-	nam: str  # le nom du fichier d'origine
-	suf: str = None
-	dat: str = None
-	hsh: str = None
-
-	def __eq__(self, other):
-		return (
-			self.pot == other.pot
-			and self.rel == other.rel
-			and self.name == other.name
-			and self.hsh == other.hsh
-		)
-
-	def __hash__(self):
-		return hash(self.hsh)
-
-	@property
-	def path(self):
-		return data_dir / self.pot / self.rel / self.name
-
-	@property
-	def name(self):
-		if self.pot in anon_set:
-			return f"{self.hsh}{self.suf}"
-		if self.dat:
-			return f"{self.dat}.{self.hsh[:6]}{self.suf}"
-		else:
-			return f"{self.stm}.{self.hsh[:16]}{self.suf}"
-
-
-@dataclasses.dataclass(slots=True)
-class RenameFile:
-	path: str  # full relative path, including pot
-	_hsh: str = None  # file checksum
-	_siz: int = None
-	_dat: str = None
-
-	def __eq__(self, other):
-		return self.path == self.path
-
-	def __hash__(self):
-		return self.siz
-
-	def setup(self):
-		u = self.hsh, self.siz, self.dat
-		return self
-
-	@property
-	def pot(self):
-		return self.path.parts[0]
-
-	@property
-	def hsh(self):
-		if self._hsh is None:
-			xx3 = xxhash.xxh3_128()
-			with self.path.open("rb") as fid:
-				while chunk := fid.read(2**24):
-					xx3.update(chunk)
-			hsh = xx3.digest()
-			self._hsh = base64.b32encode(hsh).decode("ascii")[:24]
-		return self._hsh
-
-	@property
-	def siz(self):
-		if self._siz is None:
-			self._siz = self.path.stat().st_size & 0xFF_FFFF
-		return self._siz
-
-	@property
-	def dat(self):
-		"""utilise exiftool pour trouver un date dans les métadonnées, c'est cette fonction qui est super lente !!"""
-
-		if self._dat is None:
-			ret = subprocess.run(
-				["exiftool", str(self.path)], stdout=subprocess.PIPE, check=False
-			)
-			for line in ret.stdout.decode("utf8", errors="replace").splitlines():
-				key, _, value = line.partition(":")
-				if "Create Date" == key.strip():
-					try:
-						self._dat = datetime.datetime.strptime(
-							value.strip(), "%Y:%m:%d %H:%M:%S"
-						).strftime("%Y%m%d_%H%M%S")
-					except ValueError:
-						self._dat = False
-		return self._dat
-
-	@property
-	def name(self):
-		suf = self.path.suffix.lower()
-		suf = suffix_map.get(suf, suf)
-		if self.pot in "trash":
-			return f"{self.hsh}_{self.siz:06X}{suf}"
-		if self.dat:
-			return f"{self.dat}.{self.hsh[:6]}{suf}"
-		else:
-			return f"{self.path.fname}.{self.hsh[:16]}{suf}"
-
-
-class RenameFolder:
-	def __init__(self):
-		self.__cache__ = {}
-
-		self.file_map = {}
-
-	def check_for_collisions(self):
-		"""le plus gros défi c'est 2 fichiers qui auraient le même .name mais pas le même hash..."""
-		p_map = self.sorted_by_nam_hsh()
-		for nam, q_map in p_map.items():
-			if len(q_map) != 1:
-				print("collision for:")
-				for hsh, obj in q_map.items():
-					print("hsh", obj.resolve())
-
-	def scan(self, pot: str = ""):
-		"""démarre un scan"""
-
-		t_start = time.perf_counter_ns()
-
-		pth_gen = (data_dir / pot).iter_on_suffix(*self.suffix_set)
-
-		with ThreadPoolExecutor() as pool:
-			f_set = {obj for obj in pool.map(self.file_info, pth_gen)}
-
-		t_stop = time.perf_counter_ns()
-
-		print(
-			f"scanned {len(f_set)} files in \x1b[33m{dir_map[pot]}\x1b[0m, took {int((t_stop - t_start) / 1e6)}ms"
-		)
-
-		self.file_map[pot] = f_set
-
-		return f_set
-
-	@staticmethod
-	def file_info(pth: Path):
-
-		pth = pth.resolve(strict=True)
-
-		hsh = Memories.get_checksum(pth)
-		dat = Memories.get_datetime(pth)
-
-		p_lst = pth.relative_to(data_dir).parts
-		pot = p_lst[0].lstrip("._")
-		rel = Path(*p_lst[1:-1])
-
-		stm = pth.fname
-
-		suf = pth.suffix.lower()
-		suf = Memories.replace_map.get(suf, suf)
-
-		return RenameFile(pot, rel, stm, suf, dat, hsh)
-
-	def sorted_by_pot(self):
-		if "sorted_by_pot" not in self.__cache__:
-			p_map = collections.defaultdict(set)
-			for obj in self.file_lst:
-				p_map[obj.pot].add(obj)
-			self.__cache__["sorted_by_pot"] = p_map
-		return self.__cache__["sorted_by_pot"]
-
-	def sorted_by_name_hsh(self):
-		if "sorted_by_nam_hsh" not in self.__cache__:
-			p_map = collections.defaultdict(dict)
-			for obj in self.file_lst:
-				p_map[obj.nam][obj.hsh] = obj
-			self.__cache__["sorted_by_nam_hsh"] = p_map
-		return self.__cache__["sorted_by_nam_hsh"]
-
-
-class RenameStatus(enum.Enum):
-	DONE = 0
-	RENAME = 1
-	DUPLICATE = 2
-	TRASH = -1
-	PRIVATE = -2
-
-
-hash16_rec = re.compile(r"^[A-Z2-7]{16}$")
-processed_rec = re.compile(r"^[0-9]{8}_[0-9]{6}\.[A-Z2-7]{6}$")
 
 
 """
@@ -299,12 +88,16 @@ def get_exif_date(pth_set):
 class MemoriesRename:
 	# and videos
 
-	# replace_map = {".jpeg": ".jpg"}
+	special_set = frozenset(["private", "unshared", "trash"])
 
 	def __init__(self):
 
 		self.pth_to_hsh = {}
+		self.bkt_to_pth = collections.defaultdict(set)
+
 		self.hsh_to_dat = {}
+
+		self.pth_to_nam = {}
 
 		self.bkt_to_pth = collections.defaultdict(set)
 
@@ -318,28 +111,50 @@ class MemoriesRename:
 
 	def process(self):
 
-		self.build_pth_to_hsh()
-		self.build_hsh_to_dat()
-		self.build_bkt_to_pth()
+		for bkt in dir_map:
+			p_map = self.scan_file(bkt)
+			self.pth_to_hsh |= p_map
+			self.bkt_to_pth[bkt] = set(p_map)
 
-		self.bkt_to_lst = {
-			bkt: self.setup_bucket_lst(bkt) for bkt in ["private", "unshared", "trash"]
+		(self.memories_dir / "pth_to_hsh.json").save(self.pth_to_hsh, verbose=True)
+		(self.memories_dir / "bkt_to_pth.json").save(self.bkt_to_pth, verbose=True)
+
+		self.fetch_date()
+
+		self.bkt_to_hsh = {bkt: self.setup_special(bkt) for bkt in self.special_set}
+		self.hsh_to_bkt = {
+			hsh: bkt for bkt, hsh_lst in self.bkt_to_hsh.items() for hsh in hsh_lst
 		}
+		(self.memories_dir / "bkt_to_hsh.json").save(self.bkt_to_hsh, verbose=True)
+		(self.memories_dir / "hsh_to_bkt.json").save(self.hsh_to_bkt, verbose=True)
 
-		return
+		self.check_collision()
 
-		for pot in dir_map:
-			self.folder_map[pot] = self.scan(pot)
+		self.rename_all()
 
-		# initialiser trash, private et unshare, récupérer le hash et compléter la liste
+	def iter_bkt_pth_hsh(self, *include, exclude=None):
+		bkt_set = set(include if include else set(dir_map)) - set(exclude)
 
-	def __getattr__(self, name):
-		if name.endswith("_dir") and name[:-4] in dir_map:
-			return data_dir / dir_map[name[:-4]]
+		for bkt in bkt_set:
+			for pth in self.bkt_to_pth[bkt]:
+				yield bkt, pth, self.pth_to_hsh[pth]
+
+	def get_name(self, pth, is_anonymous=False):
+		hsh = self.pth_to_hsh[pth]
+
+		nam = pth.split("/")[-1].split(".")
+		stm = nam[0]
+		suf = suffix_map.get(nam[-1], nam[-1])
+
+		if is_anonymous:
+			return f"{hsh}.{suf}"
+
+		dat = self.hsh_to_dat.get(hsh, None)
+
+		if dat:
+			return f"{dat}.{hsh[:6]}.{suf}"
 		else:
-			raise AttributeError(
-				f"{name} is not a valid attribute of class {self.__class__.__name__}"
-			)
+			return f"{stm}.{hsh[:16]}.{suf}"
 
 	def build_bkt_to_pth(self):
 		rev_map = {pre: bkt for bkt, pre in dir_map.items() if bkt is not None}
@@ -353,7 +168,7 @@ class MemoriesRename:
 
 		(self.memories_dir / "bkt_to_pth.json").save(self.bkt_to_pth, verbose=True)
 
-	def setup_bucket_lst(self, bkt):
+	def setup_special(self, bkt):
 		"""un fichier .memories/_<name> contient la liste des hash
 		tout fichier déjà présent dans le dossier correspondant est inscrit dans la liste
 		tout fichier scanné matchant est déplacé dans le dossier correspondant
@@ -377,7 +192,7 @@ class MemoriesRename:
 
 		print(list_pth.relative_to(data_dir), "contains", len(list_set), "hashes")
 
-		return list_pth, list_set
+		return list_set
 
 	@staticmethod
 	def get_hsh_siz(pth):
@@ -410,12 +225,10 @@ class MemoriesRename:
 					pass
 		return None
 
-	def build_pth_to_hsh(self):
+	def scan_file(self, bkt):
 		"""on itère sur tous les fichiers dont l'extension est dans suffix_set
 		et on récupère le hash et la taille du fichier
-
 		"""
-		print(">>> build_pth_to_hsh()")
 
 		def checksum(dir_entry):
 			xx3 = xxhash.xxh3_128()
@@ -426,22 +239,28 @@ class MemoriesRename:
 			hsh = base64.b32encode(hsh).decode("ascii")[:24]
 			siz = dir_entry.stat().st_size & 0xFF_FFFF
 			hsh = f"{hsh}_{siz:06X}"
-			return dir_entry.path[data_len:], hsh
+			return dir_entry.path, hsh
 
 		t_start = time.perf_counter_ns()
 
-		pth_gen = data_dir.iter_on_suffix(*suffix_set, as_direntry=True)
+		pth_gen = (data_dir / dir_map[bkt]).iter_on_suffix(
+			*suffix_set, as_direntry=True
+		)
+
 		with ThreadPoolExecutor() as pool:
-			self.pth_to_hsh = {pth: hsh for pth, hsh in pool.map(checksum, pth_gen)}
+			pth_to_hsh = {
+				pth[data_len:]: hsh for pth, hsh in pool.map(checksum, pth_gen)
+			}
 
 		t_stop = time.perf_counter_ns()
 
 		print(
-			f"scanned {len(self.pth_to_hsh)} files, took {int((t_stop - t_start) / 1e6)}ms"
+			f"scanned {len(pth_to_hsh)} files in {dir_map[bkt]}, took {int((t_stop - t_start) / 1e6)}ms"
 		)
-		(self.memories_dir / "pth_to_hsh.json").save(self.pth_to_hsh, verbose=True)
 
-	def build_hsh_to_dat(self):
+		return pth_to_hsh
+
+	def fetch_date(self):
 		cache_pth = self.memories_dir / "exif_date.tsv"
 
 		if cache_pth.is_file():
@@ -450,8 +269,7 @@ class MemoriesRename:
 
 		hsh_to_pth = {
 			hsh: pth
-			for pth, hsh in self.pth_to_hsh.items()
-			if pth.partition("/")[0] not in {".trash", "_collision"}
+			for bkt, pth, hsh in self.iter_bkt_pth_hsh(exclude={"trash", "collision"})
 		}
 
 		new_hsh_set = hsh_to_pth.keys() - self.hsh_to_dat.keys()
@@ -473,46 +291,49 @@ class MemoriesRename:
 
 			cache_pth.save(sorted(self.hsh_to_dat.items()))
 
-	def move(self, obj: RenameFile, pot: str, dry_run=True):
-		"""
-		on prend un obj et on le copie dans le pot
-		"""
+	def check_collision(self):
+		"""on s'assure qu'il n'y a pas 2 fichier différents (hash différents), qui auraient en fait le même nom"""
+		nam_to_hsh = collections.defaultdict(set)  # hsh to new name
+		pth_to_nam = {}
 
-		assert pot in dir_map, f"{pot} is not a valid bucket"
+		for pth in self.pth_to_hsh:
+			nam = self.get_name(pth)
+			nam_to_hsh[nam].add(self.pth_to_hsh[pth])
+			if len(nam_to_hsh[nam]) > 1:
+				raise ValueError(
+					f"collisions on name {nam} for hashes: {','.join(nam_to_hsh[nam])}"
+				)
+			self.pth_to_nam[pth] = nam
 
-		src = obj.src_absolute()
+		(self.memories_dir / "nam_to_hsh.json").save(nam_to_hsh, verbose=True)
+		(self.memories_dir / "pth_to_nam.json").save(pth_to_nam, verbose=True)
 
-		dst = obj.replace(pot=pot)
+	def move_into_bucket(self, src_pth, dst_bkt=None):
+		# print(f"move_int_bucket({src_pth}, {dst_bkt})")
+		dst_nam = self.get_name(src_pth, dst_bkt in {"trash"})
 
-		if not dry_run:
-			try:
-				tgt = obj.replace(obj, rel=dst.relative_to)
+		pth_lst = src_pth.split("/")
+		if dst_bkt:  # si le bucket n'est pas spécifié, on renomme sur place
+			pth_lst[0] = dir_map[dst_bkt]
+		pth_lst[-1] = dst_nam
+		dst_pth = "/".join(pth_lst)
 
-			except KeyError:
-				pass
-
-			self.b_map[pot][str(obj.dst_relative())] = self.b_map[obj.pot].pop(
-				str(obj.rel)
-			)
-
-		self.logger.info(
-			f"{obj.hsh}\t{src.relative_to(data_dir)} -> {dst.relative_to(data_dir)}"
-		)
-
-	def tutu(self, dry_run=True):
-		"""seuls les fichiers présents dans le dossier upload sont traités"""
-		if dry_run:
-			self.logger = setup_logger("rename")
-		else:
-			self.logger = setup_logger("rename", self.log_pth, to_stdout=False)
-
-		for pth in list(self.b_map["upload"]):
-			obj = self.b_map["upload"][pth]
-
-			for pot, (l_pth, l_set) in self.l_map.items():
-				# on teste voir si le hash est dans une des listes spéciales: private, unshared ou trash
-				if obj.hsh in l_set:
-					self.move(obj, pot, dry_run)
-					break
+		if dst_pth != src_pth:
+			if dst_pth in self.pth_to_hsh:
+				if self.pth_to_hsh[dst_pth] == self.pth_to_hsh[src_pth]:
+					print(f"{src_pth} already exists as {dst_pth}")
+					os.unlink(src_pth)
+				else:
+					raise ValueError(f"{src_pth} collide with {dst_pth}")
 			else:
-				self.move(obj, "public", dry_run)
+				print(f"{src_pth} -> {dst_pth}")
+				# os.makedirs("/".join(pth_lst[:-1]), exist_ok=True)
+				shutil.move(src_pth, dst_pth)
+
+		return dst_pth
+
+	def rename_all(self):
+		for bkt, pth_set in self.bkt_to_pth.items():
+			for src_pth in pth_set:
+				dst_bkt = self.hsh_to_bkt.get(self.pth_to_hsh[src_pth], "public")
+				self.move_into_bucket(src_pth, dst_bkt)
